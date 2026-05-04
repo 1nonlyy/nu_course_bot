@@ -148,49 +148,6 @@ def _ensure_import_stubs() -> None:
 
         trig.IntervalTrigger = IntervalTrigger
 
-    # --- playwright stubs ---
-    _install_stub_module("playwright")
-    if "playwright.async_api" not in sys.modules:
-        pa = _install_stub_module("playwright.async_api")
-
-        class Playwright: ...
-
-        class Browser: ...
-
-        class BrowserContext: ...
-
-        class Page: ...
-
-        class TimeoutError(Exception): ...
-
-        def async_playwright():
-            # Not used in tests (BrowserManager is mocked), but imported.
-            class _AP:
-                async def start(self):
-                    return self
-
-                @property
-                def chromium(self):
-                    return self
-
-                async def launch(self, *args, **kwargs):
-                    return self
-
-                async def new_context(self, *args, **kwargs):
-                    return self
-
-                async def stop(self):
-                    return None
-
-            return _AP()
-
-        pa.Playwright = Playwright
-        pa.Browser = Browser
-        pa.BrowserContext = BrowserContext
-        pa.Page = Page
-        pa.TimeoutError = TimeoutError
-        pa.async_playwright = async_playwright
-
     # --- aiosqlite stubs ---
     if "aiosqlite" not in sys.modules:
         aiosqlite = _install_stub_module("aiosqlite")
@@ -224,7 +181,6 @@ def settings_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BOT_TOKEN", "123456:ABCDEF_fake_but_valid_shape")
     monkeypatch.setenv("POLL_INTERVAL_MINUTES", "5")
     monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///./data/test.db")
-    monkeypatch.setenv("HEADLESS", "true")
     monkeypatch.setenv("LOG_LEVEL", "INFO")
     monkeypatch.setenv("CATALOG_BASE_URL", "https://registrar.nu.edu.kz")
     monkeypatch.setenv("CATALOG_TERM_ID", "824")

@@ -2,7 +2,7 @@
 
 **Telegram-бот для студентов Nazarbayev University**, который отслеживает [Public Course Catalog](https://registrar.nu.edu.kz/course-catalog) и **присылает push-уведомление, когда суммарно по всем секциям курса появляются свободные места** (переход «0 → больше нуля»). Не нужно вручную обновлять страницу регистратора: бот сам опрашивает каталог и помнит последний снимок по каждому коду.
 
-> **Киллер-фича:** умные уведомления именно о **появлении** мест (а не о каждом изменении числа), с детализацией по секциям (лекции, лаборатории, речитации) и устойчивым скрапингом SPA-каталога через Playwright.
+> **Киллер-фича:** умные уведомления именно о **появлении** мест (а не о каждом изменении числа), с детализацией по секциям (лекции, лаборатории, речитации) и опросом тех же JSON-эндпоинтов регистратора, что использует сайт (`getSearchData`, `getSchedule`), по HTTP ([httpx](https://www.python-httpx.org/)).
 
 ---
 
@@ -51,7 +51,7 @@
 |-----------|------------|
 | Язык | Python |
 | Telegram | [aiogram](https://docs.aiogram.dev/) 3.x |
-| Браузерная автоматизация | [Playwright](https://playwright.dev/python/) (Chromium, headless) |
+| HTTP-клиент (каталог) | [httpx](https://www.python-httpx.org/) (async) |
 | Планировщик | [APScheduler](https://apscheduler.readthedocs.io/) (async) |
 | База данных | SQLite через [aiosqlite](https://github.com/omnilib/aiosqlite) |
 | Конфигурация | [pydantic-settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/), [python-dotenv](https://github.com/theskumar/python-dotenv) |
@@ -60,7 +60,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat&logo=python&logoColor=white)](https://www.python.org/)
 [![aiogram](https://img.shields.io/badge/aiogram-3.x-2CA5E0?style=flat&logo=telegram&logoColor=white)](https://docs.aiogram.dev/)
-[![Playwright](https://img.shields.io/badge/Playwright-Chromium-45ba4b?style=flat)](https://playwright.dev/python/)
+[![httpx](https://img.shields.io/badge/httpx-HTTP-088787?style=flat)](https://www.python-httpx.org/)
 [![SQLite](https://img.shields.io/badge/SQLite-aiosqlite-003B57?style=flat&logo=sqlite&logoColor=white)](https://www.sqlite.org/)
 [![License](https://img.shields.io/badge/License-Use%20freely-8A2BE2?style=flat)](#-лицензия-и-дисклеймер)
 
@@ -82,7 +82,7 @@ make migrate
 make run
 ```
 
-- **`make install`** — зависимости из `requirements.txt` и `playwright install chromium`.
+- **`make install`** — зависимости из `requirements.txt`.
 - **`make migrate`** — инициализация схемы SQLite.
 - **`make run`** — запуск бота (`python3 -m bot.main`).
 
@@ -96,11 +96,10 @@ make run
 | `POLL_INTERVAL_MINUTES` | Период фонового опроса каталога (минуты) |
 | `DATABASE_URL` | URL SQLite, например `sqlite+aiosqlite:///./data/nu_bot.db` |
 | `CATALOG_BASE_URL` | Базовый URL регистратора (по умолчанию NU) |
-| `CATALOG_TERM_ID` | ID семестра в каталоге (как в JSON `getSemesters`, напр. `824` — Summer 2026) |
-| `HEADLESS` | Headless-режим браузера (`true` / `false`) |
+| `CATALOG_TERM_ID` | ID семестра в каталоге (как в выпадающем списке на сайте, напр. `824` — Summer 2026). Пустое значение: взять первый реальный семестр из HTML страницы каталога |
 | `LOG_LEVEL` | Уровень логирования (`INFO`, `DEBUG`, …) |
 | `SCRAPE_MIN_INTERVAL_SECONDS` | Мин. пауза между скрапами одного курса (опционально) |
-| `CATALOG_IGNORE_TLS_ERRORS` | Пропуск проверки TLS для каталога при проблемах с цепочкой сертификатов |
+| `CATALOG_IGNORE_TLS_ERRORS` | Пропуск проверки TLS для каталога при проблемах с цепочкой сертификатов (`true` / `false`, по умолчанию `true`) |
 
 </details>
 
@@ -108,7 +107,9 @@ make run
 
 ## 🔍 Как устроен скрапер
 
-Каталог на стороне NU — **Drupal + jQuery SPA**. Бот поднимает **headless Chromium**, открывает каталог, выполняет быстрый поиск и обращается к тем же JSON-эндпоинтам, что и сайт (`getSearchData`, `getSchedule`), через контекст запросов Playwright. Это даёт устойчивое получение секций и мест без ручного парсинга всей HTML-страницы.
+Каталог на стороне NU — **Drupal**-страница с клиентским UI, но данные по секциям и местам отдаются теми же **POST JSON**-методами, что вызывает браузер: `getSearchData` и `getSchedule` на пути `/my-registrar/public-course-catalog/json`. Бот делает **GET** на страницу каталога (сессия/куки, как у пользователя), затем вызывает эти эндпоинты через **httpx** без браузера. Если `CATALOG_TERM_ID` не задан, ID семестра читается из серверного HTML (`#semesterComboId`).
+
+**Обновление для разработчиков:** ранее использовались Playwright и класс `BrowserManager`; они удалены. Внешний код не должен импортировать `BrowserManager` из `bot.scraper`.
 
 ---
 

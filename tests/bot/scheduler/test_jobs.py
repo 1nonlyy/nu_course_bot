@@ -38,7 +38,7 @@ def _scraper_with_sections(
 ) -> MagicMock:
     """Real aggregation logic; fetch is mocked per course code."""
     scraper = MagicMock(spec=CatalogScraper)
-    real = CatalogScraper(MagicMock())
+    real = CatalogScraper()
 
     async def _fetch(course_code: str, **kwargs: object) -> list[CourseInfo]:
         return sections_by_code.get(course_code, [])
@@ -200,7 +200,7 @@ async def test_poll_per_course_exception_continues(
     db.upsert_snapshot = AsyncMock()
 
     scraper = MagicMock(spec=CatalogScraper)
-    real = CatalogScraper(MagicMock())
+    real = CatalogScraper()
 
     async def _fetch(course_code: str, **kwargs: object) -> list[CourseInfo]:
         if course_code == "BAD":

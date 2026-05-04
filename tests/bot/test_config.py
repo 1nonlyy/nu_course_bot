@@ -5,7 +5,6 @@ def test_get_settings_reads_from_env(settings_env) -> None:
     assert settings.bot_token == "123456:ABCDEF_fake_but_valid_shape"
     assert settings.poll_interval_minutes == 5
     assert settings.database_url.endswith("test.db")
-    assert settings.headless is True
     assert settings.log_level == "INFO"
     assert settings.catalog_base_url == "https://registrar.nu.edu.kz"
     assert settings.catalog_term_id == "824"

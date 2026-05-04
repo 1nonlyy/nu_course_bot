@@ -1,10 +1,8 @@
-"""Playwright-based NU course catalog integration."""
+"""NU course catalog integration (HTTP JSON API)."""
 
 from bot.scraper.catalog import CatalogScraper, CourseInfo, normalize_course_code
-from bot.scraper.browser import BrowserManager
 
 __all__ = [
-    "BrowserManager",
     "CatalogScraper",
     "CourseInfo",
     "normalize_course_code",

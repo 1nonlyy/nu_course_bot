@@ -53,7 +53,7 @@ def test_ensure_production_bot_token_allows_normal_shape() -> None:
 @pytest.mark.asyncio
 async def test_run_rejects_bad_token_before_side_effects(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Ensure the startup check fails fast (before DB/Playwright/Telegram are touched).
+    Ensure the startup check fails fast (before DB/Telegram are touched).
     """
     import bot.main as main
 
@@ -65,7 +65,6 @@ async def test_run_rejects_bad_token_before_side_effects(monkeypatch: pytest.Mon
         raise AssertionError("Unexpected side effect")
 
     monkeypatch.setattr(main, "get_database", _boom)
-    monkeypatch.setattr(main, "BrowserManager", _boom)
     monkeypatch.setattr(main, "Bot", _boom)
 
     with pytest.raises(RuntimeError, match=r"BOT_TOKEN looks like"):
@@ -77,7 +76,6 @@ async def test_run_happy_path_is_fully_mocked(monkeypatch: pytest.MonkeyPatch) -
     """
     Run through `run()` without making any external calls by mocking:
     - DB init
-    - Playwright browser lifecycle
     - Aiogram Bot/Dispatcher
     - APScheduler
     """
@@ -98,24 +96,7 @@ async def test_run_happy_path_is_fully_mocked(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(main, "get_database", lambda _settings: FakeDB())
 
-    class FakeBrowser:
-        async def start(self) -> None: ...
-
-        async def stop(self) -> None: ...
-
-    class FakeBrowserManager:
-        def __init__(self, _settings) -> None:
-            self._browser = FakeBrowser()
-
-        async def start(self) -> None:
-            await self._browser.start()
-
-        async def stop(self) -> None:
-            await self._browser.stop()
-
-    monkeypatch.setattr(main, "BrowserManager", FakeBrowserManager)
-
-    monkeypatch.setattr(main, "CatalogScraper", lambda browser, _settings: object())
+    monkeypatch.setattr(main, "CatalogScraper", lambda _settings: object())
 
     class FakeSession:
         async def close(self) -> None: ...

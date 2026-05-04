@@ -1,4 +1,4 @@
-"""Application entry: Telegram bot + APScheduler + Playwright lifecycle."""
+"""Application entry: Telegram bot + APScheduler."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from apscheduler.triggers.interval import IntervalTrigger
 from bot.config import get_settings
 from bot.db.database import get_database
 from bot.handlers import register_handlers
-from bot.scraper.browser import BrowserManager
 from bot.scraper.catalog import CatalogScraper
 from bot.scheduler.jobs import poll_catalog_job
 
@@ -79,7 +78,7 @@ def _configure_logging(level: str) -> None:
 
 
 async def run() -> None:
-    """Start polling, scheduler, and background browser."""
+    """Start polling and scheduler."""
     settings = get_settings()
     _ensure_production_bot_token(settings.bot_token)
     _configure_logging(settings.log_level)
@@ -87,9 +86,7 @@ async def run() -> None:
     db = get_database(settings)
     await db.init_schema()
 
-    browser = BrowserManager(settings)
-    await browser.start()
-    scraper = CatalogScraper(browser, settings)
+    scraper = CatalogScraper(settings)
 
     bot = Bot(
         settings.bot_token,
@@ -120,7 +117,6 @@ async def run() -> None:
         await dp.start_polling(bot)
     finally:
         scheduler.shutdown(wait=False)
-        await browser.stop()
         await bot.session.close()
 
 

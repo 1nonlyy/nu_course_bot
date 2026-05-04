@@ -44,7 +44,7 @@ async def poll_catalog_job(bot: Bot, db: Database, scraper: CatalogScraper) -> N
                 if not sections:
                     logger.warning(
                         "Skipping snapshot update for %s — scraper returned empty "
-                        "sections (possible timeout or DOM change)",
+                        "sections (timeout, HTTP/API error, or no matching course in search)",
                         course_code,
                     )
                     continue

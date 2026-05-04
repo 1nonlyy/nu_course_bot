@@ -46,7 +46,6 @@ class Settings(BaseSettings):
     bot_token: str = Field(..., alias="BOT_TOKEN")
     poll_interval_minutes: int = Field(5, ge=1, alias="POLL_INTERVAL_MINUTES")
     database_url: str = Field("sqlite+aiosqlite:///./data/nu_bot.db", alias="DATABASE_URL")
-    headless: bool = Field(True, alias="HEADLESS")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     catalog_base_url: str = Field(
         "https://registrar.nu.edu.kz",
@@ -68,8 +67,8 @@ class Settings(BaseSettings):
     catalog_ignore_tls_errors: bool = Field(
         True,
         description=(
-            "If True, Playwright skips TLS certificate verification for the catalog "
-            "(needed when registrar.nu.edu.kz chain is not in Node's default trust store). "
+            "If True, httpx skips TLS certificate verification for the catalog "
+            "(needed when registrar.nu.edu.kz chain is not in the default trust store). "
             "Set CATALOG_IGNORE_TLS_ERRORS=false if verification works on your machine."
         ),
         alias="CATALOG_IGNORE_TLS_ERRORS",

@@ -1,4 +1,13 @@
-"""NU Public Course Catalog scraping via Playwright + registrar JSON API."""
+"""NU Public Course Catalog via the registrar JSON API (httpx).
+
+The catalog UI is a Drupal page, but section/seat data comes from POST endpoints
+under ``/my-registrar/public-course-catalog/json`` (``getSearchData``, ``getSchedule``).
+No browser or JS execution is required: we warm the session with a GET to the catalog
+page (cookies + same origin as the browser flow), then call those endpoints directly.
+
+If ``CATALOG_TERM_ID`` is unset, the active semester id is read from the server-rendered
+``#semesterComboId`` options in that HTML — still no JS.
+"""
 
 from __future__ import annotations
 
@@ -11,13 +20,19 @@ from collections import defaultdict
 from typing import Any, Optional
 from urllib.parse import urljoin
 
+import httpx
 from pydantic import BaseModel, Field
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from bot.config import Settings, get_settings
-from bot.scraper.browser import BrowserManager
 
 logger = logging.getLogger(__name__)
+
+_CATALOG_JSON_PATH = "/my-registrar/public-course-catalog/json"
+_DEFAULT_HTTP_TIMEOUT = httpx.Timeout(90.0)
+_CATALOG_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 
 class CourseInfo(BaseModel):
@@ -33,6 +48,7 @@ class CourseInfo(BaseModel):
     section_type: str = ""
     course_id: str = ""
     instance_id: Optional[str] = None
+
 
 def _section_component_rank(st: str) -> tuple[int, str]:
     """Sort sections for display: lecture, lab, recitation, then other."""
@@ -89,6 +105,113 @@ def normalize_course_code(raw: str) -> Optional[str]:
     return None
 
 
+def _catalog_http_verify_flag(settings: Settings) -> bool:
+    """When catalog_ignore_tls_errors is True, disable TLS verification (registrar chain)."""
+    return not settings.catalog_ignore_tls_errors
+
+
+def _json_endpoint_url(settings: Settings) -> str:
+    base = settings.catalog_base_url.rstrip("/") + "/"
+    return urljoin(base, _CATALOG_JSON_PATH.lstrip("/"))
+
+
+def _catalog_page_url(settings: Settings) -> str:
+    return urljoin(settings.catalog_base_url.rstrip("/") + "/", "course-catalog")
+
+
+def _parse_term_id_from_catalog_html(html: str) -> str:
+    """First non-placeholder ``value`` in ``#semesterComboId`` (server-rendered HTML)."""
+    m = re.search(
+        r'id=["\']semesterComboId["\'][^>]*>(.*?)</select>',
+        html,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        raise RuntimeError("Could not find #semesterComboId in catalog HTML")
+    block = m.group(1)
+    for om in re.finditer(
+        r'<option[^>]*\svalue=["\']([^"\']*)["\']',
+        block,
+        re.IGNORECASE,
+    ):
+        vid = (om.group(1) or "").strip()
+        if vid and vid != "-1":
+            return vid
+    raise RuntimeError("Could not resolve catalog term id from semester dropdown HTML")
+
+
+def _httpx_client(settings: Settings) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        verify=_catalog_http_verify_flag(settings),
+        timeout=_DEFAULT_HTTP_TIMEOUT,
+        headers={"User-Agent": _CATALOG_USER_AGENT},
+        follow_redirects=True,
+    )
+
+
+async def post_catalog_json(
+    client: httpx.AsyncClient,
+    json_url: str,
+    form: dict[str, str | int],
+) -> Any:
+    """POST ``application/x-www-form-urlencoded`` to the registrar JSON endpoint."""
+    str_form = {k: str(v) for k, v in form.items()}
+    response = await client.post(json_url, data=str_form)
+    text = response.text
+    if response.status_code >= 400:
+        logger.error("Catalog JSON HTTP %s: %s", response.status_code, text[:500])
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        logger.error("Catalog JSON decode error: %s", text[:500])
+        return None
+
+
+async def fetch_search_data(
+    client: httpx.AsyncClient,
+    json_url: str,
+    term_id: str,
+    quick: str,
+) -> list[dict[str, Any]]:
+    """Call ``getSearchData`` (Oracle rejects empty IN () lists — keep params minimal)."""
+    payload: dict[str, str | int] = {
+        "method": "getSearchData",
+        "searchParams[formSimple]": "true",
+        "searchParams[limit]": 50,
+        "searchParams[page]": 1,
+        "searchParams[start]": 0,
+        "searchParams[quickSearch]": quick,
+        "searchParams[sortField]": -1,
+        "searchParams[sortDescending]": -1,
+        "searchParams[semester]": term_id,
+    }
+    data = await post_catalog_json(client, json_url, payload)
+    if not isinstance(data, dict):
+        return []
+    rows = data.get("data")
+    if not isinstance(rows, list):
+        return []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+async def fetch_schedule(
+    client: httpx.AsyncClient,
+    json_url: str,
+    term_id: str,
+    course_id: str,
+) -> list[dict[str, Any]]:
+    """Call ``getSchedule`` for one course offering."""
+    data = await post_catalog_json(
+        client,
+        json_url,
+        {"method": "getSchedule", "courseId": course_id, "termId": term_id},
+    )
+    if not isinstance(data, list):
+        return []
+    return [r for r in data if isinstance(r, dict)]
+
+
 class ScrapeRateLimiter:
     """Enforce minimum interval between scrapes per course code."""
 
@@ -111,105 +234,18 @@ class ScrapeRateLimiter:
 
 class CatalogScraper:
     """
-    Loads the Drupal course catalog page with Playwright, performs quick search,
-    then reads seat data from the same JSON endpoints the site uses.
+    Fetches catalog data via httpx: session warmup GET, then registrar JSON POSTs.
     """
 
     def __init__(
         self,
-        browser_manager: BrowserManager,
         settings: Optional[Settings] = None,
         rate_limiter: Optional[ScrapeRateLimiter] = None,
     ) -> None:
-        self._browser = browser_manager
         self._settings = settings or get_settings()
         self._limiter = rate_limiter or ScrapeRateLimiter(
             float(self._settings.scrape_min_interval_seconds)
         )
-        self._json_path = "/my-registrar/public-course-catalog/json"
-
-    def _catalog_url(self) -> str:
-        return urljoin(self._settings.catalog_base_url.rstrip("/") + "/", "course-catalog")
-
-    def _json_url(self) -> str:
-        return urljoin(self._settings.catalog_base_url.rstrip("/") + "/", self._json_path.lstrip("/"))
-
-    async def _resolve_term_id(self, page: Page) -> str:
-        """Pick term id from settings or the first non-placeholder semester option."""
-        if self._settings.catalog_term_id:
-            return self._settings.catalog_term_id
-        try:
-            await page.wait_for_function(
-                """() => {
-                const sel = document.querySelector('#semesterComboId');
-                return sel && sel.querySelectorAll('option').length > 1;
-            }""",
-                timeout=60_000,
-            )
-        except PlaywrightTimeoutError:
-            logger.warning("Semester combo did not populate in time")
-            raise
-        term_id = await page.evaluate(
-            """() => {
-            const opts = Array.from(
-                document.querySelectorAll('#semesterComboId option')
-            );
-            const real = opts.find(o => o.value && o.value !== '-1');
-            return real ? real.value : '';
-        }"""
-        )
-        if not term_id:
-            raise RuntimeError("Could not resolve catalog term id from page")
-        return str(term_id)
-
-    async def _post_json(self, page: Page, form: dict[str, str | int]) -> Any:
-        """POST application/x-www-form-urlencoded to the registrar JSON endpoint."""
-        str_form: dict[str, str | float | bool] = {k: str(v) for k, v in form.items()}
-        response = await page.context.request.post(
-            self._json_url(),
-            form=str_form,
-            timeout=60_000,
-        )
-        text = await response.text()
-        if response.status >= 400:
-            logger.error("Catalog JSON HTTP %s: %s", response.status, text[:500])
-            return None
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            logger.error("Catalog JSON decode error: %s", text[:500])
-            return None
-
-    async def _search_courses(self, page: Page, term_id: str, quick: str) -> list[dict[str, Any]]:
-        """Call getSearchData with minimal params (Oracle rejects empty IN () lists)."""
-        payload: dict[str, str | int] = {
-            "method": "getSearchData",
-            "searchParams[formSimple]": "true",
-            "searchParams[limit]": 50,
-            "searchParams[page]": 1,
-            "searchParams[start]": 0,
-            "searchParams[quickSearch]": quick,
-            "searchParams[sortField]": -1,
-            "searchParams[sortDescending]": -1,
-            "searchParams[semester]": term_id,
-        }
-        data = await self._post_json(page, payload)
-        if not isinstance(data, dict):
-            return []
-        rows = data.get("data")
-        if not isinstance(rows, list):
-            return []
-        return [r for r in rows if isinstance(r, dict)]
-
-    async def _fetch_schedule(self, page: Page, term_id: str, course_id: str) -> list[dict[str, Any]]:
-        """Return schedule rows for a course offering."""
-        data = await self._post_json(
-            page,
-            {"method": "getSchedule", "courseId": course_id, "termId": term_id},
-        )
-        if not isinstance(data, list):
-            return []
-        return [r for r in data if isinstance(r, dict)]
 
     @staticmethod
     def _schedule_body(row: dict[str, Any]) -> str:
@@ -239,7 +275,7 @@ class CatalogScraper:
         respect_rate_limit: bool = True,
     ) -> list[CourseInfo]:
         """
-        Scrape all sections matching ``course_code`` for the configured term.
+        Load all sections matching ``course_code`` for the configured term.
 
         ``respect_rate_limit`` is for background polling; set False for /subscribe
         and /check so users are not blocked by SCRAPE_MIN_INTERVAL_SECONDS.
@@ -253,77 +289,86 @@ class CatalogScraper:
 
         if respect_rate_limit:
             await self._limiter.wait_for_slot(normalized)
-        page: Optional[Page] = None
+
+        catalog_url = _catalog_page_url(self._settings)
+        json_url = _json_endpoint_url(self._settings)
+
         try:
-            page = await self._browser.new_page()
-            await page.goto(self._catalog_url(), wait_until="domcontentloaded", timeout=90_000)
-            term_id = await self._resolve_term_id(page)
-
-            # Seat data comes from the same JSON API the site uses; no need to drive
-            # the quick-search UI (saves up to ~60s when the DOM does not match).
-            courses = await self._search_courses(page, term_id, normalized)
-            target = normalized.replace(" ", "").upper()
-            matches = []
-            for row in courses:
-                abbr = str(row.get("ABBR", "")).replace(" ", "").upper()
-                if abbr == target:
-                    matches.append(row)
-
-            if not matches:
-                logger.info("Catalog search returned no ABBR match for %s", normalized)
-
-            results: list[CourseInfo] = []
-            title = ""
-            if matches:
-                title = str(matches[0].get("TITLE", "") or "")
-
-            for row in matches:
-                cid = str(row.get("COURSEID", ""))
-                if not cid:
-                    continue
-                title = str(row.get("TITLE", "") or title)
-                schedule_rows = await self._fetch_schedule(page, term_id, cid)
-                seen_keys: set[tuple[str, str]] = set()
-                for sec in schedule_rows:
-                    st = str(sec.get("ST", "") or "")
-                    inst = str(sec.get("INSTANCEID", "") or "")
-                    dedupe_key = (inst, st)
-                    if dedupe_key in seen_keys:
-                        continue
-                    seen_keys.add(dedupe_key)
-                    cap_raw = sec.get("CAPACITY", 0)
-                    enr_raw = sec.get("ENR", 0)
-                    try:
-                        cap = int(str(cap_raw).strip()) if str(cap_raw).strip() != "" else 0
-                        enr = int(enr_raw)
-                    except (TypeError, ValueError):
-                        cap, enr = 0, 0
-                    avail = max(0, cap - enr)
-                    faculty = str(sec.get("FACULTY", "") or "")
-                    results.append(
-                        CourseInfo(
-                            course_code=normalized,
-                            course_title=title,
-                            instructor_name=self._clean_instructor(faculty),
-                            schedule=self._schedule_label(sec),
-                            schedule_body=self._schedule_body(sec),
-                            available_seats=avail,
-                            total_seats=cap,
-                            section_type=st,
-                            course_id=cid,
-                            instance_id=inst or None,
-                        )
+            async with _httpx_client(self._settings) as client:
+                warm = await client.get(catalog_url)
+                if warm.status_code >= 400:
+                    logger.error(
+                        "Catalog page HTTP %s (session warmup)",
+                        warm.status_code,
                     )
-            return results
-        except PlaywrightTimeoutError as exc:
-            logger.warning("Playwright timeout for %s: %s", normalized, exc)
+                    return []
+
+                configured_term = (self._settings.catalog_term_id or "").strip()
+                if configured_term:
+                    term_id = configured_term
+                else:
+                    term_id = _parse_term_id_from_catalog_html(warm.text)
+
+                courses = await fetch_search_data(client, json_url, term_id, normalized)
+                target = normalized.replace(" ", "").upper()
+                matches = []
+                for row in courses:
+                    abbr = str(row.get("ABBR", "")).replace(" ", "").upper()
+                    if abbr == target:
+                        matches.append(row)
+
+                if not matches:
+                    logger.info("Catalog search returned no ABBR match for %s", normalized)
+
+                results: list[CourseInfo] = []
+                title = ""
+                if matches:
+                    title = str(matches[0].get("TITLE", "") or "")
+
+                for row in matches:
+                    cid = str(row.get("COURSEID", ""))
+                    if not cid:
+                        continue
+                    title = str(row.get("TITLE", "") or title)
+                    schedule_rows = await fetch_schedule(client, json_url, term_id, cid)
+                    seen_keys: set[tuple[str, str]] = set()
+                    for sec in schedule_rows:
+                        st = str(sec.get("ST", "") or "")
+                        inst = str(sec.get("INSTANCEID", "") or "")
+                        dedupe_key = (inst, st)
+                        if dedupe_key in seen_keys:
+                            continue
+                        seen_keys.add(dedupe_key)
+                        cap_raw = sec.get("CAPACITY", 0)
+                        enr_raw = sec.get("ENR", 0)
+                        try:
+                            cap = int(str(cap_raw).strip()) if str(cap_raw).strip() != "" else 0
+                            enr = int(enr_raw)
+                        except (TypeError, ValueError):
+                            cap, enr = 0, 0
+                        avail = max(0, cap - enr)
+                        faculty = str(sec.get("FACULTY", "") or "")
+                        results.append(
+                            CourseInfo(
+                                course_code=normalized,
+                                course_title=title,
+                                instructor_name=self._clean_instructor(faculty),
+                                schedule=self._schedule_label(sec),
+                                schedule_body=self._schedule_body(sec),
+                                available_seats=avail,
+                                total_seats=cap,
+                                section_type=st,
+                                course_id=cid,
+                                instance_id=inst or None,
+                            )
+                        )
+                return results
+        except httpx.TimeoutException as exc:
+            logger.warning("HTTP timeout for %s: %s", normalized, exc)
             return []
         except Exception:
             logger.exception("Catalog scrape failed for %s", normalized)
             return []
-        finally:
-            if page is not None:
-                await page.close()
 
     def aggregate_snapshot_payload(self, sections: list[CourseInfo]) -> dict[str, Any]:
         """Build summary fields and JSON-serializable payload for persistence."""
