@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import time
+
 from aiogram import Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
+from bot.config import get_settings
 from bot.db.database import Database
 from bot.scraper.catalog import CatalogScraper, normalize_course_code
 
 router = Router(name="list")
+
+# Per-user last /check time; in-process only (not shared across multiple bot replicas).
+_check_last_at: dict[int, float] = {}
 
 
 async def format_subscription_lines(db: Database, user_id: int) -> str:
@@ -56,6 +62,16 @@ async def cmd_check(
     if not normalized:
         await message.answer("Неверный формат курса.")
         return
+
+    if message.from_user is not None:
+        uid = message.from_user.id
+        now = time.time()
+        last = _check_last_at.get(uid)
+        limit_s = get_settings().check_rate_limit_seconds
+        if last is not None and now - last < limit_s:
+            await message.answer("Подождите немного перед следующей проверкой")
+            return
+        _check_last_at[uid] = now
 
     wait = await message.answer("Запрашиваю каталог…")
     sections = await scraper.fetch_course_sections(

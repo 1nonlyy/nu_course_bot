@@ -75,6 +75,21 @@ class Settings(BaseSettings):
         ),
         alias="CATALOG_IGNORE_TLS_ERRORS",
     )
+    max_subscriptions_per_user: int = Field(
+        10,
+        ge=1,
+        description="Maximum active course subscriptions per Telegram user.",
+        alias="MAX_SUBSCRIPTIONS_PER_USER",
+    )
+    check_rate_limit_seconds: int = Field(
+        30,
+        ge=1,
+        description=(
+            "Minimum seconds between /check per user. Stored in process memory only "
+            "(not shared if you run multiple bot workers)."
+        ),
+        alias="CHECK_RATE_LIMIT_SECONDS",
+    )
 
     @property
     def sqlite_path(self) -> Path:

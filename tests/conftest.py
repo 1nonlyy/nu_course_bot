@@ -200,6 +200,8 @@ def settings_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CATALOG_IGNORE_TLS_ERRORS", "true")
     monkeypatch.setenv("ENV", "production")
     monkeypatch.setenv("SENTRY_DSN", "")
+    monkeypatch.setenv("MAX_SUBSCRIPTIONS_PER_USER", "10")
+    monkeypatch.setenv("CHECK_RATE_LIMIT_SECONDS", "30")
 
     # Ensure `.env` isn't implicitly used in CI/dev machines running tests.
     # Pydantic will prefer explicit env vars, but this avoids surprises.

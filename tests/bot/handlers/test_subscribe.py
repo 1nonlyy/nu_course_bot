@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiogram.filters import CommandObject
 
+from bot.config import get_settings
 from bot.db.database import Database
 from bot.handlers.subscribe import cmd_subscribe, cmd_unsubscribe
 from bot.scraper.catalog import CatalogScraper, CourseInfo
@@ -167,6 +168,96 @@ async def test_unsubscribe_no_active_subscription(tmp_path) -> None:
     msg = _message_with_user(uid=8)
     await cmd_unsubscribe(msg, _command_args("CSCI 151"), db)
     assert "не было" in (msg.answer.await_args.args[0] or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_subscribe_blocks_when_at_subscription_cap(tmp_path) -> None:
+    """Eleventh distinct course is rejected before scraping; cap message is shown."""
+    db = Database(tmp_path / "cap.sqlite")
+    await db.init_schema()
+    await db.upsert_user(100, None, "U")
+    for i in range(10):
+        await db.add_subscription(100, f"CSCI {150 + i}")
+    scraper = MagicMock()
+    scraper.fetch_course_sections = AsyncMock()
+    msg = _message_with_user(uid=100)
+
+    await cmd_subscribe(msg, _command_args("MATH 162"), db, scraper)
+
+    scraper.fetch_course_sections.assert_not_called()
+    text = msg.answer.await_args.args[0] or ""
+    assert "лимит" in text.lower()
+    assert str(get_settings().max_subscriptions_per_user) in text
+    assert "/unsubscribe" in text
+    assert len(await db.list_active_subscriptions(100)) == 10
+
+
+@pytest.mark.asyncio
+async def test_subscribe_tenth_distinct_course_happy_path_when_nine_active(
+    tmp_path,
+) -> None:
+    """Under the cap, the 10th distinct subscription still runs scrape + DB writes."""
+    db = Database(tmp_path / "ten.sqlite")
+    await db.init_schema()
+    await db.upsert_user(200, None, "U")
+    for i in range(9):
+        await db.add_subscription(200, f"MATH {160 + i}")
+    sections = [_section(course_code="MATH 169", available_seats=4)]
+    scraper = MagicMock()
+    scraper.fetch_course_sections = AsyncMock(return_value=sections)
+    scraper.aggregate_snapshot_payload = CatalogScraper().aggregate_snapshot_payload
+    msg = _message_with_user(uid=200)
+
+    await cmd_subscribe(msg, _command_args("MATH 169"), db, scraper)
+
+    scraper.fetch_course_sections.assert_awaited_once()
+    assert len(await db.list_active_subscriptions(200)) == 10
+    assert await db.get_user_notification_seats(200, "MATH 169") == 4
+
+
+@pytest.mark.asyncio
+async def test_subscribe_new_course_after_unsubscribe_below_cap(tmp_path) -> None:
+    """After dropping one sub at the cap, user can add a different course again."""
+    db = Database(tmp_path / "cap3.sqlite")
+    await db.init_schema()
+    await db.upsert_user(300, None, "U")
+    for i in range(10):
+        await db.add_subscription(300, f"CSCI {150 + i}")
+    await db.deactivate_subscription(300, "CSCI 150")
+    assert len(await db.list_active_subscriptions(300)) == 9
+
+    sections = [_section(course_code="PHYS 101")]
+    scraper = MagicMock()
+    scraper.fetch_course_sections = AsyncMock(return_value=sections)
+    scraper.aggregate_snapshot_payload = CatalogScraper().aggregate_snapshot_payload
+    msg = _message_with_user(uid=300)
+
+    await cmd_subscribe(msg, _command_args("PHYS 101"), db, scraper)
+
+    scraper.fetch_course_sections.assert_awaited_once()
+    codes = {s.course_code for s in await db.list_active_subscriptions(300)}
+    assert "PHYS 101" in codes
+    assert len(codes) == 10
+
+
+@pytest.mark.asyncio
+async def test_subscribe_refresh_same_course_when_at_cap_still_scrapes(tmp_path) -> None:
+    """Re-subscribing to a course already in the active set still runs the flow at the cap."""
+    db = Database(tmp_path / "cap2.sqlite")
+    await db.init_schema()
+    await db.upsert_user(100, None, "U")
+    for i in range(10):
+        await db.add_subscription(100, f"CSCI {150 + i}")
+    sections = [_section(course_code="CSCI 150")]
+    scraper = MagicMock()
+    scraper.fetch_course_sections = AsyncMock(return_value=sections)
+    real = CatalogScraper()
+    scraper.aggregate_snapshot_payload = real.aggregate_snapshot_payload
+    msg = _message_with_user(uid=100)
+
+    await cmd_subscribe(msg, _command_args("CSCI 150"), db, scraper)
+
+    scraper.fetch_course_sections.assert_awaited()
 
 
 @pytest.mark.asyncio

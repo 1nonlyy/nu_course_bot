@@ -1,6 +1,14 @@
 import pytest
 
 
+def test_get_settings_limit_fields_defaults(settings_env) -> None:
+    from bot.config import get_settings
+
+    s = get_settings()
+    assert s.max_subscriptions_per_user == 10
+    assert s.check_rate_limit_seconds == 30
+
+
 def test_get_settings_reads_from_env(settings_env) -> None:
     from bot.config import get_settings
 
@@ -15,6 +23,8 @@ def test_get_settings_reads_from_env(settings_env) -> None:
     assert settings.catalog_term_id == "824"
     assert settings.scrape_min_interval_seconds == 180
     assert settings.catalog_ignore_tls_errors is True
+    assert settings.max_subscriptions_per_user == 10
+    assert settings.check_rate_limit_seconds == 30
 
 
 def test_get_settings_sentry_dsn_optional(

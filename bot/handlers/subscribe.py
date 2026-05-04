@@ -8,6 +8,7 @@ from aiogram import Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
+from bot.config import get_settings
 from bot.db.database import Database
 from bot.scraper.catalog import (
     CatalogScraper,
@@ -80,6 +81,17 @@ async def cmd_subscribe(
         message.from_user.username,
         message.from_user.full_name or message.from_user.first_name,
     )
+
+    settings = get_settings()
+    existing = await db.list_active_subscriptions(message.from_user.id)
+    active_codes = {s.course_code.upper() for s in existing}
+    cap = settings.max_subscriptions_per_user
+    if len(existing) >= cap and normalized.upper() not in active_codes:
+        await message.answer(
+            f"Достигнут лимит активных подписок ({cap}). "
+            "Отпишись от курса через /unsubscribe, чтобы добавить новый."
+        )
+        return
 
     wait_msg = await message.answer("Проверяю каталог…")
     sections, agg = await _scrape_aggregate(
