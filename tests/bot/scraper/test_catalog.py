@@ -483,10 +483,11 @@ async def test_fetch_course_sections_resolves_term_from_html_when_env_empty(
 
 
 @pytest.mark.asyncio
-async def test_fetch_course_sections_timeout_returns_empty(
+async def test_fetch_course_sections_timeout_returns_empty_after_retries(
     mocker: pytest.MockFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    mocker.patch("asyncio.sleep", new_callable=AsyncMock)
     scraper = CatalogScraper()
     client = MagicMock()
     client.get = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
@@ -494,7 +495,101 @@ async def test_fetch_course_sections_timeout_returns_empty(
 
     out = await scraper.fetch_course_sections("CSCI 151", respect_rate_limit=False)
     assert out == []
-    assert "timeout" in capsys.readouterr().out.lower()
+    assert client.get.await_count == 3
+    log = capsys.readouterr().out.lower()
+    assert "request failed" in log or "timeout" in log
+
+
+@pytest.mark.asyncio
+async def test_fetch_course_sections_connect_error_retries_then_succeeds(
+    mocker: pytest.MockFixture,
+) -> None:
+    """After a transient ``ConnectError``, the second attempt completes (happy retry path)."""
+    mocker.patch("asyncio.sleep", new_callable=AsyncMock)
+    scraper = CatalogScraper()
+    client = MagicMock()
+    warm_ok = MagicMock()
+    warm_ok.status_code = 200
+    warm_ok.text = "<html/>"
+    client.get = AsyncMock(
+        side_effect=[
+            httpx.ConnectError("refused"),
+            warm_ok,
+        ]
+    )
+    search_resp = MagicMock(
+        status_code=200,
+        text='{"data": [{"ABBR": "CSCI 151", "COURSEID": "42", "TITLE": "Intro CS"}]}',
+    )
+    sched_resp = MagicMock(
+        status_code=200,
+        text=(
+            '[{"ST": "01L", "INSTANCEID": "i1", "CAPACITY": 50, "ENR": 10, '
+            '"FACULTY": "Prof", "DAYS": "MW", "TIMES": "10:00", "ROOM": "101"}]'
+        ),
+    )
+    client.post = AsyncMock(side_effect=[search_resp, sched_resp])
+    mocker.patch("bot.scraper.catalog._httpx_client", return_value=_async_client_cm(client))
+
+    sections = await scraper.fetch_course_sections("CSCI 151", respect_rate_limit=False)
+
+    assert len(sections) == 1
+    assert sections[0].course_code == "CSCI 151"
+    assert client.get.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_course_sections_retry_logs_attempt_and_course_code(
+    mocker: pytest.MockFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``before_sleep`` logs structlog event with attempt number and course code."""
+    mocker.patch("asyncio.sleep", new_callable=AsyncMock)
+    scraper = CatalogScraper()
+    client = MagicMock()
+    warm_ok = MagicMock(status_code=200, text="<html/>")
+    client.get = AsyncMock(side_effect=[httpx.ConnectError("down"), warm_ok])
+    search_resp = MagicMock(
+        status_code=200,
+        text='{"data": [{"ABBR": "CSCI 151", "COURSEID": "1", "TITLE": "T"}]}',
+    )
+    sched_resp = MagicMock(
+        status_code=200,
+        text='[{"ST": "01L", "INSTANCEID": "x", "CAPACITY": 5, "ENR": 1}]',
+    )
+    client.post = AsyncMock(side_effect=[search_resp, sched_resp])
+    mocker.patch("bot.scraper.catalog._httpx_client", return_value=_async_client_cm(client))
+
+    await scraper.fetch_course_sections("CSCI 151", respect_rate_limit=False)
+
+    out = capsys.readouterr().out
+    assert "fetch_course_sections retry" in out
+    assert "attempt" in out.lower() or "Attempt" in out
+    assert "CSCI 151" in out
+
+
+@pytest.mark.asyncio
+async def test_fetch_course_sections_parse_error_does_not_retry_http(
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: pytest.MockFixture,
+) -> None:
+    """HTML term resolution: missing ``#semesterComboId`` raises immediately (no transport retry)."""
+    monkeypatch.setenv("CATALOG_TERM_ID", "")
+    from bot.config import get_settings
+
+    get_settings.cache_clear()
+
+    mocker.patch("asyncio.sleep", new_callable=AsyncMock)
+    scraper = CatalogScraper()
+    client = MagicMock()
+    warm = MagicMock(status_code=200, text="<html><body>no dropdown</body></html>")
+    client.get = AsyncMock(return_value=warm)
+    mocker.patch("bot.scraper.catalog._httpx_client", return_value=_async_client_cm(client))
+
+    sections = await scraper.fetch_course_sections("CSCI 151", respect_rate_limit=False)
+
+    assert sections == []
+    assert client.get.await_count == 1
 
 
 @pytest.mark.asyncio

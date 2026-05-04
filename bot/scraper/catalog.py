@@ -22,10 +22,19 @@ from urllib.parse import urljoin
 import httpx
 import structlog
 from pydantic import BaseModel, Field
+from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from bot.config import Settings, get_settings
 
 logger = structlog.get_logger(__name__)
+
+_FETCH_SECTIONS_RETRY_EXCEPTIONS: tuple[type[BaseException], ...]
+try:
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+except ImportError:  # pragma: no cover - catalog is httpx-only
+    _FETCH_SECTIONS_RETRY_EXCEPTIONS = (httpx.RequestError,)
+else:
+    _FETCH_SECTIONS_RETRY_EXCEPTIONS = (PlaywrightTimeoutError, httpx.RequestError)
 
 _CATALOG_JSON_PATH = "/my-registrar/public-course-catalog/json"
 _DEFAULT_HTTP_TIMEOUT = httpx.Timeout(90.0)
@@ -277,6 +286,100 @@ class CatalogScraper:
     def _clean_instructor(name: str) -> str:
         return re.sub(r"<br\s*/?>", ", ", name, flags=re.I).strip()
 
+    async def _fetch_course_sections_http(self, normalized: str) -> list[CourseInfo]:
+        def _log_before_sleep(retry_state: RetryCallState) -> None:
+            logger.warning(
+                "fetch_course_sections retry",
+                attempt=retry_state.attempt_number,
+                course_code=normalized,
+            )
+
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=2, max=10),
+            retry=retry_if_exception_type(_FETCH_SECTIONS_RETRY_EXCEPTIONS),
+            reraise=True,
+            before_sleep=_log_before_sleep,
+        )
+        async def _attempt() -> list[CourseInfo]:
+            catalog_url = _catalog_page_url(self._settings)
+            json_url = _json_endpoint_url(self._settings)
+            async with _httpx_client(self._settings) as client:
+                warm = await client.get(catalog_url)
+                if warm.status_code >= 400:
+                    logger.error(
+                        "Catalog page HTTP %s (session warmup)" % warm.status_code,
+                        http_status=warm.status_code,
+                        course_code=normalized,
+                    )
+                    return []
+
+                configured_term = (self._settings.catalog_term_id or "").strip()
+                if configured_term:
+                    term_id = configured_term
+                else:
+                    term_id = _parse_term_id_from_catalog_html(warm.text)
+
+                courses = await fetch_search_data(client, json_url, term_id, normalized)
+                target = normalized.replace(" ", "").upper()
+                matches = []
+                for row in courses:
+                    abbr = str(row.get("ABBR", "")).replace(" ", "").upper()
+                    if abbr == target:
+                        matches.append(row)
+
+                if not matches:
+                    logger.info(
+                        "Catalog search returned no ABBR match for %s" % normalized,
+                        course_code=normalized,
+                    )
+
+                results: list[CourseInfo] = []
+                title = ""
+                if matches:
+                    title = str(matches[0].get("TITLE", "") or "")
+
+                for row in matches:
+                    cid = str(row.get("COURSEID", ""))
+                    if not cid:
+                        continue
+                    title = str(row.get("TITLE", "") or title)
+                    schedule_rows = await fetch_schedule(client, json_url, term_id, cid)
+                    seen_keys: set[tuple[str, str]] = set()
+                    for sec in schedule_rows:
+                        st = str(sec.get("ST", "") or "")
+                        inst = str(sec.get("INSTANCEID", "") or "")
+                        dedupe_key = (inst, st)
+                        if dedupe_key in seen_keys:
+                            continue
+                        seen_keys.add(dedupe_key)
+                        cap_raw = sec.get("CAPACITY", 0)
+                        enr_raw = sec.get("ENR", 0)
+                        try:
+                            cap = int(str(cap_raw).strip()) if str(cap_raw).strip() != "" else 0
+                            enr = int(enr_raw)
+                        except (TypeError, ValueError):
+                            cap, enr = 0, 0
+                        avail = max(0, cap - enr)
+                        faculty = str(sec.get("FACULTY", "") or "")
+                        results.append(
+                            CourseInfo(
+                                course_code=normalized,
+                                course_title=title,
+                                instructor_name=self._clean_instructor(faculty),
+                                schedule=self._schedule_label(sec),
+                                schedule_body=self._schedule_body(sec),
+                                available_seats=avail,
+                                total_seats=cap,
+                                section_type=st,
+                                course_id=cid,
+                                instance_id=inst or None,
+                            )
+                        )
+                return results
+
+        return await _attempt()
+
     async def fetch_course_sections(
         self,
         course_code: str,
@@ -289,7 +392,10 @@ class CatalogScraper:
         ``respect_rate_limit`` is for background polling; set False for /subscribe
         and /check so users are not blocked by SCRAPE_MIN_INTERVAL_SECONDS.
 
-        On failure (timeout, network, parse), logs and returns an empty list.
+        Parse errors and HTTP error responses are handled in-app (empty list). Transport
+        errors (timeouts, connection failures) are retried; if all attempts fail, logs and
+        returns an empty list so callers always get a ``list`` (no uncaught
+        ``httpx.RequestError``).
         """
         t0 = time.monotonic()
         log_course_code = course_code
@@ -307,96 +413,21 @@ class CatalogScraper:
             if respect_rate_limit:
                 await self._limiter.wait_for_slot(normalized)
 
-            catalog_url = _catalog_page_url(self._settings)
-            json_url = _json_endpoint_url(self._settings)
-
-            try:
-                async with _httpx_client(self._settings) as client:
-                    warm = await client.get(catalog_url)
-                    if warm.status_code >= 400:
-                        logger.error(
-                            "Catalog page HTTP %s (session warmup)" % warm.status_code,
-                            http_status=warm.status_code,
-                            course_code=normalized,
-                        )
-                        return []
-
-                    configured_term = (self._settings.catalog_term_id or "").strip()
-                    if configured_term:
-                        term_id = configured_term
-                    else:
-                        term_id = _parse_term_id_from_catalog_html(warm.text)
-
-                    courses = await fetch_search_data(client, json_url, term_id, normalized)
-                    target = normalized.replace(" ", "").upper()
-                    matches = []
-                    for row in courses:
-                        abbr = str(row.get("ABBR", "")).replace(" ", "").upper()
-                        if abbr == target:
-                            matches.append(row)
-
-                    if not matches:
-                        logger.info(
-                            "Catalog search returned no ABBR match for %s" % normalized,
-                            course_code=normalized,
-                        )
-
-                    results: list[CourseInfo] = []
-                    title = ""
-                    if matches:
-                        title = str(matches[0].get("TITLE", "") or "")
-
-                    for row in matches:
-                        cid = str(row.get("COURSEID", ""))
-                        if not cid:
-                            continue
-                        title = str(row.get("TITLE", "") or title)
-                        schedule_rows = await fetch_schedule(client, json_url, term_id, cid)
-                        seen_keys: set[tuple[str, str]] = set()
-                        for sec in schedule_rows:
-                            st = str(sec.get("ST", "") or "")
-                            inst = str(sec.get("INSTANCEID", "") or "")
-                            dedupe_key = (inst, st)
-                            if dedupe_key in seen_keys:
-                                continue
-                            seen_keys.add(dedupe_key)
-                            cap_raw = sec.get("CAPACITY", 0)
-                            enr_raw = sec.get("ENR", 0)
-                            try:
-                                cap = int(str(cap_raw).strip()) if str(cap_raw).strip() != "" else 0
-                                enr = int(enr_raw)
-                            except (TypeError, ValueError):
-                                cap, enr = 0, 0
-                            avail = max(0, cap - enr)
-                            faculty = str(sec.get("FACULTY", "") or "")
-                            results.append(
-                                CourseInfo(
-                                    course_code=normalized,
-                                    course_title=title,
-                                    instructor_name=self._clean_instructor(faculty),
-                                    schedule=self._schedule_label(sec),
-                                    schedule_body=self._schedule_body(sec),
-                                    available_seats=avail,
-                                    total_seats=cap,
-                                    section_type=st,
-                                    course_id=cid,
-                                    instance_id=inst or None,
-                                )
-                            )
-                    return results
-            except httpx.TimeoutException as exc:
-                logger.warning(
-                    "HTTP timeout for %s: %s" % (normalized, exc),
-                    course_code=normalized,
-                    error=str(exc),
-                )
-                return []
-            except Exception:
-                logger.exception(
-                    "Catalog scrape failed for %s" % normalized,
-                    course_code=normalized,
-                )
-                return []
+            return await self._fetch_course_sections_http(normalized)
+        except httpx.RequestError as exc:
+            logger.warning(
+                "Catalog scrape request failed for %s after retries: %s"
+                % (log_course_code, exc),
+                course_code=log_course_code,
+                error=str(exc),
+            )
+            return []
+        except Exception:
+            logger.exception(
+                "Catalog scrape failed for %s" % log_course_code,
+                course_code=log_course_code,
+            )
+            return []
         finally:
             elapsed = time.monotonic() - t0
             logger.info(
