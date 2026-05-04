@@ -17,6 +17,9 @@ from bot.db.models import CourseSnapshot, Subscription
 
 logger = logging.getLogger(__name__)
 
+# Milliseconds SQLite waits when the DB is locked (e.g. concurrent poll_catalog tasks).
+_SQLITE_BUSY_TIMEOUT_MS = 10_000
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     telegram_id INTEGER PRIMARY KEY,
@@ -69,11 +72,21 @@ class Database:
 
     @asynccontextmanager
     async def connect(self) -> AsyncIterator[aiosqlite.Connection]:
-        """Open a connection with foreign keys and WAL; closes when the block exits."""
+        """
+        Open a connection with foreign keys, WAL, and busy timeout.
+
+        WAL allows concurrent readers; writers still serialize. The catalog poll runs
+        many courses in parallel, so each connection waits up to
+        ``_SQLITE_BUSY_TIMEOUT_MS`` instead of failing immediately with "database is locked".
+        """
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(self._db_path) as conn:
+        async with aiosqlite.connect(
+            self._db_path,
+            timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000.0,
+        ) as conn:
             await conn.execute("PRAGMA foreign_keys = ON")
             await conn.execute("PRAGMA journal_mode = WAL")
+            await conn.execute(f"PRAGMA busy_timeout = {_SQLITE_BUSY_TIMEOUT_MS}")
             yield conn
 
     async def init_schema(self) -> None:

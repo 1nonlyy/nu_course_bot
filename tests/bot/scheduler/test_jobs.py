@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from unittest.mock import ANY, AsyncMock, MagicMock
 
@@ -9,7 +10,7 @@ import pytest
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 
 from bot.db.models import CourseSnapshot
-from bot.scheduler.jobs import _send_with_retry, poll_catalog_job
+from bot.scheduler.jobs import _send_with_retry, check_one_course, poll_catalog_job
 from bot.scraper.catalog import CatalogScraper, CourseInfo
 
 pytestmark = pytest.mark.usefixtures("settings_env")
@@ -262,7 +263,7 @@ async def test_poll_per_course_exception_continues(
     assert db.upsert_snapshot.await_count == 1
     assert db.upsert_snapshot.await_args[0][0] == "GOOD"
     out = capsys.readouterr().out
-    assert "Poll failed for course scrape" in out
+    assert "poll_catalog course check failed" in out
     assert "BAD" in out
 
 
@@ -432,6 +433,451 @@ async def test_poll_scrape_raises_includes_course_code_and_user_count(
     await poll_catalog_job(mock_bot, db, scraper)
 
     out = capsys.readouterr().out
-    assert "Poll failed for course scrape" in out
+    assert "poll_catalog course check failed" in out
     assert "BAD" in out
     assert "user_count" in out
+
+
+# ---------------------------------------------------------------------------
+# check_one_course — direct unit tests
+# ---------------------------------------------------------------------------
+
+def _make_sem() -> asyncio.Semaphore:
+    return asyncio.Semaphore(5)
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_check_one_course_happy_path_upserts_snapshot(
+    mock_bot: MagicMock,
+) -> None:
+    """Happy path: scrapes sections, upserts snapshot with correct seats."""
+    sec = _sample_section(available_seats=3, total_seats=50)
+    db = MagicMock()
+    db.get_snapshot = AsyncMock(return_value=None)
+    db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=None)
+    db.upsert_user_notification_state = AsyncMock()
+    scraper = _scraper_with_sections({"CSCI 151": [sec]})
+
+    await check_one_course(
+        "CSCI 151", [1001], mock_bot, db, scraper, sem=_make_sem(), checked_at=_now()
+    )
+
+    db.upsert_snapshot.assert_awaited_once()
+    assert db.upsert_snapshot.await_args[0][0] == "CSCI 151"
+    assert db.upsert_snapshot.await_args[0][1] == 3
+
+
+@pytest.mark.asyncio
+async def test_check_one_course_logs_structured_fields(
+    mock_bot: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Success path emits course_code, seats_found, user_count, checked_at in log."""
+    sec = _sample_section(available_seats=7)
+    db = MagicMock()
+    db.get_snapshot = AsyncMock(return_value=None)
+    db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=None)
+    db.upsert_user_notification_state = AsyncMock()
+    scraper = _scraper_with_sections({"CSCI 151": [sec]})
+
+    await check_one_course(
+        "CSCI 151", [1], mock_bot, db, scraper, sem=_make_sem(), checked_at=_now()
+    )
+
+    out = capsys.readouterr().out
+    assert "seats_found" in out
+    assert "user_count" in out
+    assert "CSCI 151" in out
+    assert "checked_at" in out
+
+
+@pytest.mark.asyncio
+async def test_check_one_course_empty_sections_returns_early(
+    mock_bot: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Empty sections: no snapshot upsert, logs warning with 'empty sections'."""
+    db = MagicMock()
+    db.upsert_snapshot = AsyncMock()
+    db.get_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock()
+    scraper = _scraper_with_sections({"CSCI 151": []})
+
+    await check_one_course(
+        "CSCI 151", [1], mock_bot, db, scraper, sem=_make_sem(), checked_at=_now()
+    )
+
+    db.upsert_snapshot.assert_not_awaited()
+    db.get_snapshot.assert_not_awaited()
+    out = capsys.readouterr().out
+    assert "Skipping snapshot update for CSCI 151" in out
+    assert "empty sections" in out.lower()
+
+
+@pytest.mark.asyncio
+async def test_check_one_course_scrape_exception_propagates(
+    mock_bot: MagicMock,
+) -> None:
+    """Scrape error is NOT swallowed — asyncio.gather captures it via return_exceptions."""
+    scraper = MagicMock(spec=CatalogScraper)
+    scraper.fetch_course_sections = AsyncMock(side_effect=RuntimeError("boom"))
+    db = MagicMock()
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await check_one_course(
+            "CSCI 151", [1], mock_bot, db, scraper, sem=_make_sem(), checked_at=_now()
+        )
+
+
+@pytest.mark.asyncio
+async def test_check_one_course_first_time_subscriber_stores_seats_no_push(
+    mock_bot: MagicMock,
+) -> None:
+    """First subscription (last_notified=None): state is seeded with current seats, no push."""
+    sec = _sample_section(available_seats=5)
+    db = MagicMock()
+    db.get_snapshot = AsyncMock(return_value=None)
+    db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=None)
+    db.upsert_user_notification_state = AsyncMock()
+    scraper = _scraper_with_sections({"CSCI 151": [sec]})
+
+    await check_one_course(
+        "CSCI 151", [42], mock_bot, db, scraper, sem=_make_sem(), checked_at=_now()
+    )
+
+    mock_bot.send_message.assert_not_awaited()
+    db.upsert_user_notification_state.assert_awaited_once_with(42, "CSCI 151", 5)
+
+
+@pytest.mark.asyncio
+async def test_check_one_course_zero_to_positive_triggers_push(
+    mock_bot: MagicMock,
+) -> None:
+    """Zero baseline + seats just opened → exactly one Telegram push, state updated."""
+    sec = _sample_section(available_seats=2)
+    db = MagicMock()
+    db.get_snapshot = AsyncMock(return_value=None)
+    db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=0)
+    db.upsert_user_notification_state = AsyncMock()
+    scraper = _scraper_with_sections({"CSCI 151": [sec]})
+
+    await check_one_course(
+        "CSCI 151", [99], mock_bot, db, scraper, sem=_make_sem(), checked_at=_now()
+    )
+
+    mock_bot.send_message.assert_awaited_once_with(99, ANY)
+    db.upsert_user_notification_state.assert_awaited_once_with(99, "CSCI 151", 2)
+
+
+@pytest.mark.asyncio
+async def test_check_one_course_nonzero_baseline_no_push(
+    mock_bot: MagicMock,
+) -> None:
+    """User already had seats (last_notified > 0): no push, state still updated."""
+    sec = _sample_section(available_seats=4)
+    db = MagicMock()
+    db.get_snapshot = AsyncMock(return_value=None)
+    db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=3)
+    db.upsert_user_notification_state = AsyncMock()
+    scraper = _scraper_with_sections({"CSCI 151": [sec]})
+
+    await check_one_course(
+        "CSCI 151", [77], mock_bot, db, scraper, sem=_make_sem(), checked_at=_now()
+    )
+
+    mock_bot.send_message.assert_not_awaited()
+    db.upsert_user_notification_state.assert_awaited_once_with(77, "CSCI 151", 4)
+
+
+@pytest.mark.asyncio
+async def test_check_one_course_positive_to_zero_resets_state(
+    mock_bot: MagicMock,
+) -> None:
+    """Course fills up again (seats → 0): reset user state to 0 so next opening notifies."""
+    sec = _sample_section(available_seats=0)
+    db = MagicMock()
+    db.get_snapshot = AsyncMock(return_value=None)
+    db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=5)
+    db.upsert_user_notification_state = AsyncMock()
+    scraper = _scraper_with_sections({"CSCI 151": [sec]})
+
+    await check_one_course(
+        "CSCI 151", [55], mock_bot, db, scraper, sem=_make_sem(), checked_at=_now()
+    )
+
+    mock_bot.send_message.assert_not_awaited()
+    db.upsert_user_notification_state.assert_awaited_once_with(55, "CSCI 151", 0)
+
+
+@pytest.mark.asyncio
+async def test_check_one_course_forbidden_user_updates_state(
+    mock_bot: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """TelegramForbiddenError: logs warning, updates state, does not propagate."""
+    sec = _sample_section(available_seats=1)
+    db = MagicMock()
+    db.get_snapshot = AsyncMock(return_value=None)
+    db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=0)
+    db.upsert_user_notification_state = AsyncMock()
+    scraper = _scraper_with_sections({"CSCI 151": [sec]})
+    mock_bot.send_message = AsyncMock(side_effect=TelegramForbiddenError("blocked"))
+
+    await check_one_course(
+        "CSCI 151", [11], mock_bot, db, scraper, sem=_make_sem(), checked_at=_now()
+    )
+
+    db.upsert_user_notification_state.assert_awaited_once_with(11, "CSCI 151", 1)
+    assert "blocked the bot" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_check_one_course_send_error_does_not_update_state(
+    mock_bot: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Non-forbidden Telegram error: logs exception, does NOT update notification state."""
+    sec = _sample_section(available_seats=1)
+    db = MagicMock()
+    db.get_snapshot = AsyncMock(return_value=None)
+    db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=0)
+    db.upsert_user_notification_state = AsyncMock()
+    scraper = _scraper_with_sections({"CSCI 151": [sec]})
+    mock_bot.send_message = AsyncMock(side_effect=RuntimeError("net error"))
+
+    await check_one_course(
+        "CSCI 151", [22], mock_bot, db, scraper, sem=_make_sem(), checked_at=_now()
+    )
+
+    db.upsert_user_notification_state.assert_not_awaited()
+    assert "Failed to notify user" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_check_one_course_multiple_users_independent(
+    mock_bot: MagicMock,
+) -> None:
+    """Multiple users for one course: each gets the right notification decision."""
+    sec = _sample_section(available_seats=3)
+    db = MagicMock()
+    db.get_snapshot = AsyncMock(return_value=None)
+    db.upsert_snapshot = AsyncMock()
+    # user 10: zero baseline → notify; user 20: non-zero baseline → no push
+    db.get_user_notification_seats = AsyncMock(side_effect=[0, 2])
+    db.upsert_user_notification_state = AsyncMock()
+    scraper = _scraper_with_sections({"CSCI 151": [sec]})
+
+    await check_one_course(
+        "CSCI 151", [10, 20], mock_bot, db, scraper, sem=_make_sem(), checked_at=_now()
+    )
+
+    mock_bot.send_message.assert_awaited_once_with(10, ANY)
+    assert db.upsert_user_notification_state.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_check_one_course_prev_snapshot_used_for_log(
+    mock_bot: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """prev_seats appears in log output when a prior snapshot exists."""
+    prev = CourseSnapshot(
+        id=1,
+        course_code="CSCI 151",
+        available_seats=0,
+        instructor=None,
+        schedule=None,
+        last_checked=datetime.now(timezone.utc),
+        raw_json=None,
+    )
+    sec = _sample_section(available_seats=2)
+    db = MagicMock()
+    db.get_snapshot = AsyncMock(return_value=prev)
+    db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=0)
+    db.upsert_user_notification_state = AsyncMock()
+    scraper = _scraper_with_sections({"CSCI 151": [sec]})
+
+    await check_one_course(
+        "CSCI 151", [1], mock_bot, db, scraper, sem=_make_sem(), checked_at=_now()
+    )
+
+    out = capsys.readouterr().out
+    assert "prev_seats" in out
+
+
+# ---------------------------------------------------------------------------
+# asyncio.gather error-path and semaphore concurrency tests for poll_catalog_job
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_poll_gather_logs_course_code_and_error_message(
+    mock_bot: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Gather captures the exception; log includes course_code and the error string."""
+    db = MagicMock()
+    db.all_active_subscriptions_grouped = AsyncMock(return_value={"FAIL": [1, 2]})
+    scraper = MagicMock(spec=CatalogScraper)
+    scraper.fetch_course_sections = AsyncMock(side_effect=ValueError("bad data"))
+    scraper.aggregate_snapshot_payload = CatalogScraper().aggregate_snapshot_payload
+
+    await poll_catalog_job(mock_bot, db, scraper)
+
+    out = capsys.readouterr().out
+    assert "poll_catalog course check failed" in out
+    assert "FAIL" in out
+    assert "bad data" in out
+
+
+@pytest.mark.asyncio
+async def test_poll_gather_all_failures_logged_job_does_not_raise(
+    mock_bot: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every course failing is still swallowed; every course_code appears in logs."""
+    codes = {"AA": [1], "BB": [2], "CC": [3]}
+    db = MagicMock()
+    db.all_active_subscriptions_grouped = AsyncMock(return_value=codes)
+    scraper = MagicMock(spec=CatalogScraper)
+    scraper.fetch_course_sections = AsyncMock(side_effect=RuntimeError("x"))
+    scraper.aggregate_snapshot_payload = CatalogScraper().aggregate_snapshot_payload
+
+    await poll_catalog_job(mock_bot, db, scraper)  # must not raise
+
+    out = capsys.readouterr().out
+    for code in codes:
+        assert code in out
+
+
+@pytest.mark.asyncio
+async def test_poll_gather_partial_failure_good_courses_complete(
+    mock_bot: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Failing courses are logged; unrelated good courses still upsert their snapshot."""
+    good = "MATH 101"
+    fail_codes = {"FAIL1": [1], "FAIL2": [2]}
+    sec = _sample_section(course_code=good, course_title="Math")
+
+    real = CatalogScraper()
+    scraper = MagicMock(spec=CatalogScraper)
+
+    async def _fetch(course_code: str, **kwargs: object) -> list[CourseInfo]:
+        if course_code in fail_codes:
+            raise RuntimeError("deliberate failure")
+        return [sec]
+
+    scraper.fetch_course_sections = _fetch
+    scraper.aggregate_snapshot_payload = real.aggregate_snapshot_payload
+
+    db = MagicMock()
+    db.all_active_subscriptions_grouped = AsyncMock(
+        return_value={**fail_codes, good: [3]}
+    )
+    db.get_snapshot = AsyncMock(return_value=None)
+    db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=None)
+    db.upsert_user_notification_state = AsyncMock()
+
+    await poll_catalog_job(mock_bot, db, scraper)
+
+    assert db.upsert_snapshot.await_count == 1
+    assert db.upsert_snapshot.await_args[0][0] == good
+    out = capsys.readouterr().out
+    assert "FAIL1" in out
+    assert "FAIL2" in out
+
+
+@pytest.mark.asyncio
+async def test_poll_semaphore_limits_concurrent_scrapes(
+    mock_bot: MagicMock,
+) -> None:
+    """With Semaphore(5), at most 5 fetch_course_sections calls run simultaneously."""
+    n_courses = 12
+    codes = [f"COURSE {i:02d}" for i in range(n_courses)]
+    grouped = {code: [i] for i, code in enumerate(codes)}
+
+    concurrent_now: int = 0
+    peak_concurrent: int = 0
+    lock = asyncio.Lock()
+
+    async def slow_fetch(course_code: str, **kwargs: object) -> list[CourseInfo]:
+        nonlocal concurrent_now, peak_concurrent
+        async with lock:
+            concurrent_now += 1
+            peak_concurrent = max(peak_concurrent, concurrent_now)
+        await asyncio.sleep(0.02)
+        async with lock:
+            concurrent_now -= 1
+        return [_sample_section(course_code=course_code, course_title="T")]
+
+    real = CatalogScraper()
+    scraper = MagicMock(spec=CatalogScraper)
+    scraper.fetch_course_sections = slow_fetch
+    scraper.aggregate_snapshot_payload = real.aggregate_snapshot_payload
+
+    db = MagicMock()
+    db.all_active_subscriptions_grouped = AsyncMock(return_value=grouped)
+    db.get_snapshot = AsyncMock(return_value=None)
+    db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=None)
+    db.upsert_user_notification_state = AsyncMock()
+
+    await poll_catalog_job(mock_bot, db, scraper)
+
+    assert peak_concurrent <= 5, f"peak_concurrent={peak_concurrent} exceeded semaphore of 5"
+    assert db.upsert_snapshot.await_count == n_courses
+
+
+@pytest.mark.asyncio
+async def test_poll_all_courses_run_concurrently_not_sequentially(
+    mock_bot: MagicMock,
+) -> None:
+    """With N courses and Semaphore(5), total elapsed time is much less than N * delay."""
+    import time
+
+    n_courses = 10
+    delay = 0.05
+    grouped = {f"C{i}": [i] for i in range(n_courses)}
+
+    real = CatalogScraper()
+    scraper = MagicMock(spec=CatalogScraper)
+
+    async def slow_fetch(course_code: str, **kwargs: object) -> list[CourseInfo]:
+        await asyncio.sleep(delay)
+        return [_sample_section(course_code=course_code, course_title="T")]
+
+    scraper.fetch_course_sections = slow_fetch
+    scraper.aggregate_snapshot_payload = real.aggregate_snapshot_payload
+
+    db = MagicMock()
+    db.all_active_subscriptions_grouped = AsyncMock(return_value=grouped)
+    db.get_snapshot = AsyncMock(return_value=None)
+    db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=None)
+    db.upsert_user_notification_state = AsyncMock()
+
+    start = time.monotonic()
+    await poll_catalog_job(mock_bot, db, scraper)
+    elapsed = time.monotonic() - start
+
+    # Sequential would take n_courses * delay = 0.5 s; concurrent batches of 5 → ~0.1 s.
+    # We allow generous headroom (3× a single batch) to avoid flakiness on slow CI.
+    assert elapsed < delay * n_courses * 0.6, (
+        f"elapsed={elapsed:.3f}s suggests courses ran sequentially"
+    )
+    assert db.upsert_snapshot.await_count == n_courses
