@@ -97,9 +97,10 @@ async def test_run_happy_path_is_fully_mocked(
 
     # Avoid real logging config churn in tests.
     monkeypatch.setattr(main, "_configure_logging", lambda *_a, **_k: None)
+    # Stub out Alembic: we don't want a real migration during a unit test.
+    monkeypatch.setattr(main, "_run_migrations", lambda _settings: None)
 
-    class FakeDB:
-        async def init_schema(self) -> None: ...
+    class FakeDB: ...
 
     monkeypatch.setattr(main, "get_database", lambda _settings: FakeDB())
 
@@ -186,9 +187,9 @@ async def test_run_initializes_sentry_when_dsn_configured(
     )
     monkeypatch.setattr(main, "get_settings", lambda: settings)
     monkeypatch.setattr(main, "_configure_logging", lambda *_a, **_k: None)
+    monkeypatch.setattr(main, "_run_migrations", lambda _settings: None)
 
-    class FakeDB:
-        async def init_schema(self) -> None: ...
+    class FakeDB: ...
 
     monkeypatch.setattr(main, "get_database", lambda _settings: FakeDB())
     monkeypatch.setattr(main, "CatalogScraper", lambda _settings: object())
@@ -227,4 +228,107 @@ async def test_run_initializes_sentry_when_dsn_configured(
 
     await main.run()
     sentry_init.assert_called_once_with(dsn=dsn, traces_sample_rate=0.1)
+
+
+def test_run_migrations_creates_schema(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_run_migrations`` should bring a brand-new SQLite file up to ``head``."""
+    import sqlite3
+
+    import bot.main as main
+
+    db_file = tmp_path / "fresh.db"
+    settings = SimpleNamespace(
+        database_url=f"sqlite+aiosqlite:///{db_file}",
+    )
+
+    main._run_migrations(settings)
+
+    # Tables from the initial migration plus Alembic's bookkeeping must exist.
+    conn = sqlite3.connect(db_file)
+    try:
+        names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    finally:
+        conn.close()
+    expected = {
+        "alembic_version",
+        "users",
+        "subscriptions",
+        "course_snapshots",
+        "user_notification_state",
+    }
+    assert expected.issubset(names), f"missing tables: {expected - names}"
+
+
+def test_run_migrations_propagates_database_url_to_environ(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``alembic/env.py`` reads ``$DATABASE_URL`` first; main.py must set it.
+
+    pydantic-settings does NOT push values from ``.env`` into ``os.environ``,
+    so without this propagation Alembic would fall back to the placeholder URL
+    in ``alembic.ini`` and migrate the wrong file.
+    """
+    import bot.main as main
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    db_file = tmp_path / "from_env.db"
+    settings = SimpleNamespace(database_url=f"sqlite+aiosqlite:///{db_file}")
+
+    main._run_migrations(settings)
+
+    import os as _os
+
+    assert _os.environ.get("DATABASE_URL") == settings.database_url
+    assert db_file.is_file(), "Alembic should have created the DB at the URL we set"
+
+
+def test_run_migrations_idempotent_on_existing_legacy_db(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Running migrations against a DB previously built by ``Database.init_schema``
+    must succeed without dropping data — the migration uses ``IF NOT EXISTS``."""
+    import sqlite3
+
+    import bot.main as main
+    from bot.db.database import Database
+
+    db_file = tmp_path / "legacy.db"
+    db = Database(db_file)
+
+    import asyncio as _asyncio
+
+    _asyncio.run(db.init_schema())
+
+    # Insert a row to prove migration is non-destructive.
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute(
+            "INSERT INTO users (telegram_id, username, first_name) VALUES (?, ?, ?)",
+            (42, "alice", "Alice"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    settings = SimpleNamespace(database_url=f"sqlite+aiosqlite:///{db_file}")
+    main._run_migrations(settings)
+
+    conn = sqlite3.connect(db_file)
+    try:
+        (count,) = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE telegram_id = 42"
+        ).fetchone()
+        version_rows = list(conn.execute("SELECT version_num FROM alembic_version"))
+    finally:
+        conn.close()
+
+    assert count == 1, "Migration must not delete pre-existing rows"
+    assert version_rows == [("0001",)], "Alembic must stamp the DB at head"
 

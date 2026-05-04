@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import sentry_sdk
@@ -14,14 +16,18 @@ from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import TelegramObject
+from alembic import command as alembic_command
+from alembic.config import Config as AlembicConfig
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from bot.config import get_settings
+from bot.config import Settings, get_settings
 from bot.db.database import get_database
 from bot.handlers import register_handlers
 from bot.scraper.catalog import CatalogScraper
 from bot.scheduler.jobs import poll_catalog_job
+
+_ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
 
 logger = structlog.get_logger(__name__)
 
@@ -36,6 +42,26 @@ _FORBIDDEN_BOT_TOKEN_PREFIXES: tuple[str, ...] = (
     "test:",
     "000000000:",
 )
+
+
+def _run_migrations(settings: Settings) -> None:
+    """Apply pending Alembic migrations (synchronous; called via ``to_thread``).
+
+    The application uses async aiosqlite at runtime, but Alembic's machinery is
+    synchronous. We invoke it from a worker thread so the asyncio event loop is
+    not blocked during startup. ``alembic/env.py`` reads the same
+    ``DATABASE_URL`` (after stripping the ``+aiosqlite`` driver) so prod and
+    migrations always target the same SQLite file.
+
+    We propagate ``DATABASE_URL`` through the process environment because
+    pydantic-settings reads ``.env`` into the ``Settings`` model but never
+    injects values into ``os.environ``. Alembic's ``env.py`` reads the
+    environment first, so this guarantees the migration hits the same DB the
+    bot will then open.
+    """
+    os.environ["DATABASE_URL"] = settings.database_url
+    cfg = AlembicConfig(str(_ALEMBIC_INI))
+    alembic_command.upgrade(cfg, "head")
 
 
 def _ensure_production_bot_token(token: str) -> None:
@@ -114,8 +140,10 @@ async def run() -> None:
     if (settings.sentry_dsn or "").strip():
         sentry_sdk.init(dsn=settings.sentry_dsn, traces_sample_rate=0.1)
 
+    # Apply any pending Alembic migrations before opening any aiosqlite
+    # connections; the worker thread keeps the event loop responsive.
+    await asyncio.to_thread(_run_migrations, settings)
     db = get_database(settings)
-    await db.init_schema()
 
     scraper = CatalogScraper(settings)
 

@@ -84,8 +84,9 @@ make run
 
 - **`make install`** — только runtime-зависимости из `requirements.txt`.
 - **`make install-dev`** — runtime + pytest (см. `requirements-dev.txt`); нужно для `pytest tests/`.
-- **`make migrate`** — инициализация схемы SQLite.
-- **`make run`** — запуск бота (`python3 -m bot.main`).
+- **`make migrate`** — применить все pending Alembic-миграции (`alembic upgrade head`).
+- **`make migration name="add foo"`** — сгенерировать пустой шаблон новой миграции.
+- **`make run`** — запуск бота (`python3 -m bot.main`); сам выполнит `alembic upgrade head` при старте.
 
 ### Переменные окружения
 
@@ -105,6 +106,57 @@ make run
 | `CATALOG_IGNORE_TLS_ERRORS` | Пропуск проверки TLS для каталога при проблемах с цепочкой сертификатов (`true` / `false`, по умолчанию `true`) |
 
 </details>
+
+---
+
+## 🗃 Миграции схемы (Alembic)
+
+Схема SQLite управляется через [Alembic](https://alembic.sqlalchemy.org/). Конфигурация — `alembic.ini`, скрипты — `alembic/versions/`. URL базы Alembic читает из `DATABASE_URL` (та же переменная, что у бота); драйвер `+aiosqlite` снимается на лету в `alembic/env.py`, потому что Alembic работает синхронно.
+
+Команды:
+
+```bash
+# Применить все миграции к текущей БД
+make migrate                 # = alembic upgrade head
+
+# Создать пустую миграцию
+make migration name="add notification_email column"
+
+# Откатить на одну ревизию
+alembic downgrade -1
+
+# Статус (текущая ревизия в БД)
+alembic current
+
+# Применить к произвольному файлу (не из .env)
+alembic -x dburl=sqlite:///./backups/old.db upgrade head
+```
+
+При запуске `python3 -m bot.main` (или контейнера) функция `_run_migrations` из `bot/main.py` вызывает `alembic upgrade head` в отдельном потоке (через `asyncio.to_thread`), чтобы не блокировать event loop. Если у вас уже есть БД, созданная старым `init_schema()` — Alembic поверх неё применит baseline-миграцию `0001` идемпотентно (DDL содержит `IF NOT EXISTS`), просто добавив таблицу `alembic_version`.
+
+---
+
+## 💾 Резервное копирование SQLite
+
+Скрипт `scripts/backup_db.sh` делает онлайн-бэкап через `sqlite3 .backup` (безопасно при работающем боте в WAL-режиме) и удаляет копии старше `RETENTION_DAYS` (по умолчанию 7).
+
+```bash
+# Разовый запуск
+./scripts/backup_db.sh
+
+# Переопределение путей
+DB_PATH=data/nu_bot.db BACKUP_DIR=/var/backups/nu_bot ./scripts/backup_db.sh
+```
+
+**Cron для ежедневного бэкапа в 03:30:**
+
+```cron
+30 3 * * * cd /path/to/nu_course_bot && /usr/bin/env bash scripts/backup_db.sh >> data/backups/backup.log 2>&1
+```
+
+Установка: `crontab -e` и вставьте строку выше. Проверка списка задач: `crontab -l`. Лог пишется в `data/backups/backup.log`.
+
+> **Совет:** при запуске в Docker монтируйте `./data` томом (так уже сделано в `docker-compose.yml`), а cron настраивайте на хосте — он будет видеть БД и каталог бэкапов через тот же volume.
 
 ---
 

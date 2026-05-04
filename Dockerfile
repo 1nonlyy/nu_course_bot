@@ -20,6 +20,10 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot/ ./bot/
+# Alembic migrations run at startup from bot/main.py; both the config and the
+# versions/ directory must be present in the image.
+COPY alembic.ini ./alembic.ini
+COPY alembic/ ./alembic/
 
 # Non-root user; /app/data is the mount target for the SQLite file from docker-compose.
 RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin app \

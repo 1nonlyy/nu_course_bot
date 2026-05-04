@@ -94,6 +94,17 @@ def test_dockerfile_skips_playwright_install(dockerfile_text: str) -> None:
     )
 
 
+def test_dockerfile_copies_alembic_artifacts(dockerfile_text: str) -> None:
+    """``bot.main._run_migrations`` opens ``alembic.ini`` from the repo root,
+    so both the ini file and the ``alembic/`` directory must land in the image."""
+    assert re.search(r"^COPY\s+alembic\.ini\b", dockerfile_text, re.MULTILINE), (
+        "Dockerfile must COPY alembic.ini (read by bot.main at startup)"
+    )
+    assert re.search(r"^COPY\s+alembic/\s+\./alembic/?", dockerfile_text, re.MULTILINE), (
+        "Dockerfile must COPY alembic/ (env.py + versions/)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # .dockerignore
 # ---------------------------------------------------------------------------
@@ -264,6 +275,101 @@ def test_dev_requirements_chains_runtime_requirements(
     assert any(
         line.replace(" ", "") == "-rrequirements.txt" for line in dev_requirements
     ), "requirements-dev.txt must include `-r requirements.txt`"
+
+
+# ---------------------------------------------------------------------------
+# mypy.ini
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# requirements.txt — alembic must be present (used at runtime by bot.main)
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_requirements_includes_alembic() -> None:
+    p = REPO_ROOT / "requirements.txt"
+    assert p.is_file()
+    lines = [
+        line.strip()
+        for line in p.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert any(
+        re.match(r"^alembic(\s|>=|==|<=|~=|<|>|;|$)", line) for line in lines
+    ), "alembic must be in requirements.txt (imported at startup by bot.main)"
+
+
+# ---------------------------------------------------------------------------
+# alembic.ini + alembic/env.py + initial migration
+# ---------------------------------------------------------------------------
+
+
+def test_alembic_ini_present_and_points_at_alembic_dir() -> None:
+    p = REPO_ROOT / "alembic.ini"
+    assert p.is_file(), "alembic.ini missing at repo root"
+    parser = configparser.ConfigParser()
+    parser.read(p, encoding="utf-8")
+    assert parser.has_section("alembic"), "alembic.ini must have [alembic] section"
+    # raw=True: Alembic substitutes %(here)s itself; configparser would error.
+    script_location = parser.get("alembic", "script_location", raw=True, fallback="")
+    assert "alembic" in script_location, (
+        f"script_location should reference the alembic/ directory, got {script_location!r}"
+    )
+
+
+def test_alembic_env_py_strips_async_driver() -> None:
+    """env.py must convert sqlite+aiosqlite:// → sqlite:// for sync Alembic."""
+    p = REPO_ROOT / "alembic" / "env.py"
+    assert p.is_file()
+    text = p.read_text(encoding="utf-8")
+    assert "sqlite+aiosqlite" in text and "sqlite:" in text, (
+        "alembic/env.py must mention both URL forms (it converts aiosqlite → sync)"
+    )
+    assert "bot.config" in text or "DATABASE_URL" in text, (
+        "alembic/env.py must read DATABASE_URL from bot.config or the environment"
+    )
+
+
+def test_initial_migration_revision_present() -> None:
+    """Sanity: at least one revision file exists and the baseline is identifiable."""
+    versions_dir = REPO_ROOT / "alembic" / "versions"
+    assert versions_dir.is_dir()
+    files = sorted(p for p in versions_dir.iterdir() if p.suffix == ".py")
+    assert files, "alembic/versions/ must contain at least one migration"
+    text = "\n".join(f.read_text(encoding="utf-8") for f in files)
+    assert "users" in text and "subscriptions" in text and "course_snapshots" in text, (
+        "Initial migration must create the four core tables"
+    )
+    assert "user_notification_state" in text
+
+
+# ---------------------------------------------------------------------------
+# scripts/backup_db.sh
+# ---------------------------------------------------------------------------
+
+
+def test_backup_script_is_executable_and_safe() -> None:
+    p = REPO_ROOT / "scripts" / "backup_db.sh"
+    assert p.is_file(), "scripts/backup_db.sh missing"
+    import os as _os
+    import stat
+
+    mode = p.stat().st_mode
+    assert mode & stat.S_IXUSR, "backup_db.sh must be executable (chmod +x)"
+
+    text = p.read_text(encoding="utf-8")
+    assert text.startswith("#!"), "Shebang line missing"
+    assert "set -euo pipefail" in text, "backup_db.sh should use strict mode"
+    # Must use the actual project DB filename (not the spec's typo "bot.db").
+    assert "nu_bot.db" in text, "Default DB path must be data/nu_bot.db, not data/bot.db"
+    # Retention prune must target the backup pattern, not all .db files.
+    assert "-mtime +" in text and "nu_bot_*.db" in text, (
+        "Retention prune must use -mtime and match nu_bot_*.db only"
+    )
+    # Smoke check: script references sqlite3 .backup for WAL-safety.
+    assert ".backup" in text, "Should prefer sqlite3 .backup over plain cp for WAL safety"
+    _ = _os  # silence flake
 
 
 # ---------------------------------------------------------------------------
