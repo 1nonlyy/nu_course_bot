@@ -102,6 +102,9 @@ async def cmd_subscribe(
         agg.get("schedule"),
         agg["payload"],
     )
+    await db.upsert_user_notification_state(
+        message.from_user.id, normalized, int(agg["available_seats"])
+    )
 
     await message.answer(_status_reply(agg, len(sections)))
 

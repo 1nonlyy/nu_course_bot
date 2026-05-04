@@ -148,17 +148,20 @@ def _ensure_import_stubs() -> None:
 
         trig.IntervalTrigger = IntervalTrigger
 
-    # --- aiosqlite stubs ---
-    if "aiosqlite" not in sys.modules:
-        aiosqlite = _install_stub_module("aiosqlite")
+    # --- aiosqlite stubs (only if the real package is not installed) ---
+    try:
+        import aiosqlite  # noqa: F401
+    except ImportError:
+        if "aiosqlite" not in sys.modules:
+            aiosqlite = _install_stub_module("aiosqlite")
 
-        class Connection: ...
+            class Connection: ...
 
-        async def connect(*args, **kwargs):  # pragma: no cover
-            return Connection()
+            async def connect(*args, **kwargs):  # pragma: no cover
+                return Connection()
 
-        aiosqlite.Connection = Connection
-        aiosqlite.connect = connect
+            aiosqlite.Connection = Connection
+            aiosqlite.connect = connect
 
 
 _ensure_import_stubs()

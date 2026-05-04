@@ -46,6 +46,13 @@ CREATE TABLE IF NOT EXISTS course_snapshots (
     last_checked TEXT NOT NULL DEFAULT (datetime('now')),
     raw_json TEXT
 );
+
+CREATE TABLE IF NOT EXISTS user_notification_state (
+    user_id INTEGER NOT NULL,
+    course_code TEXT NOT NULL,
+    notified_at_seats INTEGER NOT NULL,
+    PRIMARY KEY (user_id, course_code)
+);
 """
 
 
@@ -128,15 +135,25 @@ class Database:
 
     async def deactivate_subscription(self, user_id: int, course_code: str) -> int:
         """Deactivate subscription; return number of rows updated."""
+        code = course_code.upper()
         async with self.session() as conn:
             cur = await conn.execute(
                 """
                 UPDATE subscriptions SET is_active = 0
                 WHERE user_id = ? AND course_code = ? AND is_active = 1
                 """,
-                (user_id, course_code.upper()),
+                (user_id, code),
             )
-            return cur.rowcount if cur.rowcount is not None else 0
+            n = cur.rowcount if cur.rowcount is not None else 0
+            if n:
+                await conn.execute(
+                    """
+                    DELETE FROM user_notification_state
+                    WHERE user_id = ? AND course_code = ?
+                    """,
+                    (user_id, code),
+                )
+            return n
 
     async def list_active_subscriptions(self, user_id: int) -> list[Subscription]:
         """Return active subscriptions for a user."""
@@ -219,6 +236,39 @@ class Database:
                     _utc_now_iso(),
                     raw_json,
                 ),
+            )
+
+    async def get_user_notification_seats(
+        self, user_id: int, course_code: str
+    ) -> Optional[int]:
+        """Return stored notified_at_seats for this user/course, or None if missing."""
+        async with self.connect() as conn:
+            cur = await conn.execute(
+                """
+                SELECT notified_at_seats FROM user_notification_state
+                WHERE user_id = ? AND course_code = ?
+                """,
+                (user_id, course_code.upper()),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return int(row[0])
+
+    async def upsert_user_notification_state(
+        self, user_id: int, course_code: str, notified_at_seats: int
+    ) -> None:
+        """Insert or update per-user notification baseline for a course."""
+        async with self.session() as conn:
+            await conn.execute(
+                """
+                INSERT INTO user_notification_state
+                    (user_id, course_code, notified_at_seats)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id, course_code) DO UPDATE SET
+                    notified_at_seats = excluded.notified_at_seats
+                """,
+                (user_id, course_code.upper(), notified_at_seats),
             )
 
 

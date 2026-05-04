@@ -27,9 +27,11 @@ async def _send_with_retry(bot: Bot, chat_id: int, text: str) -> None:
 
 async def poll_catalog_job(bot: Bot, db: Database, scraper: CatalogScraper) -> None:
     """
-    For every course with active subscribers, scrape once and notify on 0 → N seat openings.
+    For every course with active subscribers, scrape once and notify per user when their
+    baseline was zero seats and the course now has open seats.
 
-    Updates ``course_snapshots`` and logs each check. Never raises to the scheduler.
+    Updates ``course_snapshots`` (for /mysubs) and ``user_notification_state`` for
+    notification decisions. Never raises to the scheduler.
     """
     checked_at = datetime.now(timezone.utc).replace(microsecond=0)
     try:
@@ -71,29 +73,44 @@ async def poll_catalog_job(bot: Bot, db: Database, scraper: CatalogScraper) -> N
                     len(user_ids),
                 )
 
-                if (
-                    prev is not None
-                    and old_avail == 0
-                    and new_avail > 0
-                    and sections
-                ):
-                    title = str(agg.get("course_title") or course_code)
-                    body = format_open_seats_message(
-                        title,
-                        course_code,
-                        str(agg.get("instructor") or "—"),
-                        str(agg.get("schedule") or "—"),
-                        str(agg.get("seats_by_section") or ""),
-                        new_avail,
-                        int(agg.get("total_seats_display") or 0),
-                    )
-                    for uid in user_ids:
+                title = str(agg.get("course_title") or course_code)
+                for uid in user_ids:
+                    last_notified = await db.get_user_notification_seats(uid, course_code)
+                    if last_notified is None:
+                        await db.upsert_user_notification_state(
+                            uid, course_code, new_avail
+                        )
+                        continue
+                    if new_avail == 0:
+                        await db.upsert_user_notification_state(uid, course_code, 0)
+                        continue
+                    if last_notified == 0 and new_avail > 0:
+                        body = format_open_seats_message(
+                            title,
+                            course_code,
+                            str(agg.get("instructor") or "—"),
+                            str(agg.get("schedule") or "—"),
+                            str(agg.get("seats_by_section") or ""),
+                            new_avail,
+                            int(agg.get("total_seats_display") or 0),
+                        )
                         try:
                             await _send_with_retry(bot, uid, body)
                         except TelegramForbiddenError:
                             logger.warning("User %s blocked the bot; skip notify", uid)
+                            await db.upsert_user_notification_state(
+                                uid, course_code, new_avail
+                            )
                         except Exception:
                             logger.exception("Failed to notify user %s", uid)
+                        else:
+                            await db.upsert_user_notification_state(
+                                uid, course_code, new_avail
+                            )
+                        continue
+                    await db.upsert_user_notification_state(
+                        uid, course_code, new_avail
+                    )
             except Exception:
                 logger.exception("Poll failed for course %s", course_code)
     except Exception:

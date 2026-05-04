@@ -77,6 +77,8 @@ async def test_poll_happy_path_upserts_snapshot(mock_bot: MagicMock) -> None:
     db.all_active_subscriptions_grouped = AsyncMock(return_value={"CSCI 151": [1001]})
     db.get_snapshot = AsyncMock(return_value=None)
     db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=None)
+    db.upsert_user_notification_state = AsyncMock()
     scraper = _scraper_with_sections({"CSCI 151": [sec]})
 
     await poll_catalog_job(mock_bot, db, scraper)
@@ -86,6 +88,7 @@ async def test_poll_happy_path_upserts_snapshot(mock_bot: MagicMock) -> None:
     assert args[0] == "CSCI 151"
     assert args[1] == 2
     mock_bot.send_message.assert_not_awaited()
+    db.upsert_user_notification_state.assert_awaited_once_with(1001, "CSCI 151", 2)
 
 
 @pytest.mark.asyncio
@@ -97,6 +100,8 @@ async def test_poll_empty_sections_skips_upsert_and_logs_warning(
     db.all_active_subscriptions_grouped = AsyncMock(return_value={"CSCI 151": [1001]})
     db.get_snapshot = AsyncMock()
     db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock()
+    db.upsert_user_notification_state = AsyncMock()
     scraper = _scraper_with_sections({"CSCI 151": []})
 
     with caplog.at_level(logging.WARNING):
@@ -104,6 +109,7 @@ async def test_poll_empty_sections_skips_upsert_and_logs_warning(
 
     db.upsert_snapshot.assert_not_awaited()
     db.get_snapshot.assert_not_awaited()
+    db.get_user_notification_seats.assert_not_awaited()
     assert "Skipping snapshot update for CSCI 151" in caplog.text
     assert "empty sections" in caplog.text
     mock_bot.send_message.assert_not_awaited()
@@ -121,6 +127,8 @@ async def test_poll_empty_sections_one_course_other_still_updates(
     )
     db.get_snapshot = AsyncMock(return_value=None)
     db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=None)
+    db.upsert_user_notification_state = AsyncMock()
     scraper = _scraper_with_sections(
         {
             "EMPTY": [],
@@ -134,6 +142,39 @@ async def test_poll_empty_sections_one_course_other_still_updates(
     assert db.upsert_snapshot.await_count == 1
     assert db.upsert_snapshot.await_args[0][0] == "MATH 162"
     assert "Skipping snapshot update for EMPTY" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_poll_notifies_only_users_with_zero_baseline(
+    mock_bot: MagicMock,
+) -> None:
+    """Per-user state: subscriber already at non-zero baseline gets no push."""
+    prev = CourseSnapshot(
+        id=1,
+        course_code="CSCI 151",
+        available_seats=0,
+        instructor=None,
+        schedule=None,
+        last_checked=datetime.now(timezone.utc),
+        raw_json=None,
+    )
+    sec = _sample_section(available_seats=5, total_seats=50)
+    db = MagicMock()
+    db.all_active_subscriptions_grouped = AsyncMock(
+        return_value={"CSCI 151": [10, 20]}
+    )
+    db.get_snapshot = AsyncMock(return_value=prev)
+    db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(
+        side_effect=[0, 3]
+    )  # 10: notify; 20: already "had seats"
+    db.upsert_user_notification_state = AsyncMock()
+    scraper = _scraper_with_sections({"CSCI 151": [sec]})
+
+    await poll_catalog_job(mock_bot, db, scraper)
+
+    mock_bot.send_message.assert_awaited_once_with(10, ANY)
+    assert db.upsert_user_notification_state.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -154,6 +195,8 @@ async def test_poll_notifies_on_zero_to_positive_seats(mock_bot: MagicMock) -> N
     )
     db.get_snapshot = AsyncMock(return_value=prev)
     db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=0)
+    db.upsert_user_notification_state = AsyncMock()
     scraper = _scraper_with_sections({"CSCI 151": [sec]})
 
     await poll_catalog_job(mock_bot, db, scraper)
@@ -161,6 +204,7 @@ async def test_poll_notifies_on_zero_to_positive_seats(mock_bot: MagicMock) -> N
     assert mock_bot.send_message.await_count == 2
     mock_bot.send_message.assert_any_await(2002, ANY)
     mock_bot.send_message.assert_any_await(2003, ANY)
+    assert db.upsert_user_notification_state.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -179,12 +223,15 @@ async def test_poll_no_notify_when_still_zero_seats(mock_bot: MagicMock) -> None
     db.all_active_subscriptions_grouped = AsyncMock(return_value={"CSCI 151": [1]})
     db.get_snapshot = AsyncMock(return_value=prev)
     db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=0)
+    db.upsert_user_notification_state = AsyncMock()
     scraper = _scraper_with_sections({"CSCI 151": [sec]})
 
     await poll_catalog_job(mock_bot, db, scraper)
 
     db.upsert_snapshot.assert_awaited_once()
     mock_bot.send_message.assert_not_awaited()
+    db.upsert_user_notification_state.assert_awaited_once_with(1, "CSCI 151", 0)
 
 
 @pytest.mark.asyncio
@@ -198,6 +245,8 @@ async def test_poll_per_course_exception_continues(
     )
     db.get_snapshot = AsyncMock(return_value=None)
     db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=None)
+    db.upsert_user_notification_state = AsyncMock()
 
     scraper = MagicMock(spec=CatalogScraper)
     real = CatalogScraper()
@@ -256,6 +305,67 @@ async def test_send_with_retry_waits_and_retries(
 
 
 @pytest.mark.asyncio
+async def test_poll_send_failure_does_not_update_notification_state(
+    mock_bot: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If Telegram send fails (non-forbidden), keep notified_at_seats so the next poll retries."""
+    prev = CourseSnapshot(
+        id=1,
+        course_code="CSCI 151",
+        available_seats=0,
+        instructor=None,
+        schedule=None,
+        last_checked=datetime.now(timezone.utc),
+        raw_json=None,
+    )
+    sec = _sample_section(available_seats=2)
+    db = MagicMock()
+    db.all_active_subscriptions_grouped = AsyncMock(return_value={"CSCI 151": [5001]})
+    db.get_snapshot = AsyncMock(return_value=prev)
+    db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=0)
+    db.upsert_user_notification_state = AsyncMock()
+    scraper = _scraper_with_sections({"CSCI 151": [sec]})
+    mock_bot.send_message = AsyncMock(side_effect=RuntimeError("telegram down"))
+
+    with caplog.at_level(logging.ERROR):
+        await poll_catalog_job(mock_bot, db, scraper)
+
+    mock_bot.send_message.assert_awaited_once()
+    db.upsert_user_notification_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_poll_positive_seats_drop_to_zero_resets_baseline(
+    mock_bot: MagicMock,
+) -> None:
+    """Edge: was open seats, course fills again — store 0 so a later opening can notify."""
+    prev = CourseSnapshot(
+        id=1,
+        course_code="CSCI 151",
+        available_seats=4,
+        instructor=None,
+        schedule=None,
+        last_checked=datetime.now(timezone.utc),
+        raw_json=None,
+    )
+    sec = _sample_section(available_seats=0, total_seats=50)
+    db = MagicMock()
+    db.all_active_subscriptions_grouped = AsyncMock(return_value={"CSCI 151": [6001]})
+    db.get_snapshot = AsyncMock(return_value=prev)
+    db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=4)
+    db.upsert_user_notification_state = AsyncMock()
+    scraper = _scraper_with_sections({"CSCI 151": [sec]})
+
+    await poll_catalog_job(mock_bot, db, scraper)
+
+    mock_bot.send_message.assert_not_awaited()
+    db.upsert_user_notification_state.assert_awaited_once_with(6001, "CSCI 151", 0)
+
+
+@pytest.mark.asyncio
 async def test_poll_forbidden_user_skips_notify(mock_bot: MagicMock) -> None:
     prev = CourseSnapshot(
         id=1,
@@ -273,6 +383,8 @@ async def test_poll_forbidden_user_skips_notify(mock_bot: MagicMock) -> None:
     )
     db.get_snapshot = AsyncMock(return_value=prev)
     db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(return_value=0)
+    db.upsert_user_notification_state = AsyncMock()
     scraper = _scraper_with_sections({"CSCI 151": [sec]})
 
     mock_bot.send_message = AsyncMock(
