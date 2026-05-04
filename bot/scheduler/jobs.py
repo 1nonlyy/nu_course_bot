@@ -41,6 +41,14 @@ async def poll_catalog_job(bot: Bot, db: Database, scraper: CatalogScraper) -> N
         for course_code, user_ids in grouped.items():
             try:
                 sections = await scraper.fetch_course_sections(course_code)
+                if not sections:
+                    logger.warning(
+                        "Skipping snapshot update for %s — scraper returned empty "
+                        "sections (possible timeout or DOM change)",
+                        course_code,
+                    )
+                    continue
+
                 agg = scraper.aggregate_snapshot_payload(sections)
                 prev = await db.get_snapshot(course_code)
                 new_avail = int(agg["available_seats"])

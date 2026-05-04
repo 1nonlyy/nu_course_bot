@@ -164,7 +164,7 @@ class CatalogScraper:
 
     async def _post_json(self, page: Page, form: dict[str, str | int]) -> Any:
         """POST application/x-www-form-urlencoded to the registrar JSON endpoint."""
-        str_form = {k: str(v) for k, v in form.items()}
+        str_form: dict[str, str | float | bool] = {k: str(v) for k, v in form.items()}
         response = await page.context.request.post(
             self._json_url(),
             form=str_form,
