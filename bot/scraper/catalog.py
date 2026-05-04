@@ -182,7 +182,7 @@ class CatalogScraper:
 
     async def _search_courses(self, page: Page, term_id: str, quick: str) -> list[dict[str, Any]]:
         """Call getSearchData with minimal params (Oracle rejects empty IN () lists)."""
-        payload = {
+        payload: dict[str, str | int] = {
             "method": "getSearchData",
             "searchParams[formSimple]": "true",
             "searchParams[limit]": 50,

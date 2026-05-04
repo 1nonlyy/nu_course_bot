@@ -22,6 +22,33 @@ from bot.scraper.browser import BrowserManager
 from bot.scraper.catalog import CatalogScraper
 from bot.scheduler.jobs import poll_catalog_job
 
+# Placeholder / obvious non-production token prefixes (real tokens start with digits, then ":").
+_FORBIDDEN_BOT_TOKEN_PREFIXES: tuple[str, ...] = (
+    "change_me",
+    "your_",
+    "placeholder",
+    "dummy",
+    "invalid",
+    "xxxxx",
+    "test:",
+    "000000000:",
+)
+
+
+def _ensure_production_bot_token(token: str) -> None:
+    t = token.strip()
+    if not t:
+        raise RuntimeError(
+            "BOT_TOKEN is empty. Set a valid token from @BotFather in .env "
+            "(never commit .env)."
+        )
+    lower = t.lower()
+    if any(lower.startswith(p) for p in _FORBIDDEN_BOT_TOKEN_PREFIXES):
+        raise RuntimeError(
+            "BOT_TOKEN looks like a placeholder or test value. Replace it with your "
+            "real token from @BotFather in .env (see .env.example)."
+        )
+
 
 class InjectMiddleware(BaseMiddleware):
     """Provide ``db`` and ``scraper`` to handlers."""
@@ -54,6 +81,7 @@ def _configure_logging(level: str) -> None:
 async def run() -> None:
     """Start polling, scheduler, and background browser."""
     settings = get_settings()
+    _ensure_production_bot_token(settings.bot_token)
     _configure_logging(settings.log_level)
 
     db = get_database(settings)

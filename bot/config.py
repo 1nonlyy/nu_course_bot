@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     """Bot and scraper configuration."""
 
     model_config = SettingsConfigDict(
+        # Never commit `.env` (secrets). Track `.env.example` only; copy it locally.
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
@@ -89,4 +90,5 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     """Return cached settings instance."""
-    return Settings()
+    # Pydantic settings are populated from env/.env at runtime; mypy can't model this.
+    return Settings()  # type: ignore[call-arg]
