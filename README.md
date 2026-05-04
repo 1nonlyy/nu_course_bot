@@ -75,14 +75,15 @@
 git clone <url-репозитория> && cd nu_course_bot
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
-make install
+make install-dev
 cp .env.example .env
 # Укажите BOT_TOKEN и при необходимости CATALOG_TERM_ID
 make migrate
 make run
 ```
 
-- **`make install`** — зависимости из `requirements.txt`.
+- **`make install`** — только runtime-зависимости из `requirements.txt`.
+- **`make install-dev`** — runtime + pytest (см. `requirements-dev.txt`); нужно для `pytest tests/`.
 - **`make migrate`** — инициализация схемы SQLite.
 - **`make run`** — запуск бота (`python3 -m bot.main`).
 
@@ -93,6 +94,8 @@ make run
 | Переменная | Назначение |
 |------------|------------|
 | `BOT_TOKEN` | Токен бота от [@BotFather](https://t.me/BotFather) |
+| `ENV` | `production` (логи JSON) или `dev` (консольный вывод structlog) |
+| `SENTRY_DSN` | Опционально: DSN Sentry для ошибок; пусто — отключено |
 | `POLL_INTERVAL_MINUTES` | Период фонового опроса каталога (минуты) |
 | `DATABASE_URL` | URL SQLite, например `sqlite+aiosqlite:///./data/nu_bot.db` |
 | `CATALOG_BASE_URL` | Базовый URL регистратора (по умолчанию NU) |

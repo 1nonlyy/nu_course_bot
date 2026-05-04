@@ -265,12 +265,13 @@ async def test_scrape_rate_limiter_sleeps_when_interval_not_elapsed(
 
 
 @pytest.mark.asyncio
-async def test_fetch_course_sections_invalid_code_returns_empty(caplog: pytest.LogCaptureFixture) -> None:
+async def test_fetch_course_sections_invalid_code_returns_empty(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     scraper = CatalogScraper()
-    with caplog.at_level("WARNING"):
-        out = await scraper.fetch_course_sections("not-a-course", respect_rate_limit=False)
+    out = await scraper.fetch_course_sections("not-a-course", respect_rate_limit=False)
     assert out == []
-    assert "Invalid course code" in caplog.text
+    assert "Invalid course code" in capsys.readouterr().out
 
 
 @pytest.mark.asyncio
@@ -290,6 +291,7 @@ async def test_fetch_course_sections_warmup_http_error_returns_empty(
 @pytest.mark.asyncio
 async def test_fetch_course_sections_happy_path_builds_course_info(
     mocker: pytest.MockFixture,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     scraper = CatalogScraper()
     client = MagicMock()
@@ -325,6 +327,10 @@ async def test_fetch_course_sections_happy_path_builds_course_info(
     assert s.instructor_name == "Dr, X"
     assert "01L" in s.schedule
     assert s.instance_id == "i1"
+    finish_log = capsys.readouterr().out
+    assert "Catalog scrape finished" in finish_log
+    assert "scrape_duration_seconds" in finish_log
+    assert "CSCI 151" in finish_log
 
 
 @pytest.mark.asyncio
@@ -414,7 +420,7 @@ async def test_fetch_course_sections_bad_capacity_enrollment_defaults_zero(
 @pytest.mark.asyncio
 async def test_fetch_course_sections_no_abbr_match_returns_empty(
     mocker: pytest.MockFixture,
-    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     scraper = CatalogScraper()
     client = MagicMock()
@@ -427,10 +433,11 @@ async def test_fetch_course_sections_no_abbr_match_returns_empty(
     client.post = AsyncMock(side_effect=[search_resp])
     mocker.patch("bot.scraper.catalog._httpx_client", return_value=_async_client_cm(client))
 
-    with caplog.at_level("INFO"):
-        sections = await scraper.fetch_course_sections("CSCI 151", respect_rate_limit=False)
+    sections = await scraper.fetch_course_sections("CSCI 151", respect_rate_limit=False)
     assert sections == []
-    assert "no ABBR match" in caplog.text
+    out = capsys.readouterr().out
+    assert "no ABBR match" in out
+    assert "scrape_duration_seconds" in out
 
 
 @pytest.mark.asyncio
@@ -478,33 +485,32 @@ async def test_fetch_course_sections_resolves_term_from_html_when_env_empty(
 @pytest.mark.asyncio
 async def test_fetch_course_sections_timeout_returns_empty(
     mocker: pytest.MockFixture,
-    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     scraper = CatalogScraper()
     client = MagicMock()
     client.get = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
     mocker.patch("bot.scraper.catalog._httpx_client", return_value=_async_client_cm(client))
 
-    with caplog.at_level("WARNING"):
-        out = await scraper.fetch_course_sections("CSCI 151", respect_rate_limit=False)
+    out = await scraper.fetch_course_sections("CSCI 151", respect_rate_limit=False)
     assert out == []
-    assert "timeout" in caplog.text.lower()
+    assert "timeout" in capsys.readouterr().out.lower()
 
 
 @pytest.mark.asyncio
 async def test_fetch_course_sections_unexpected_error_returns_empty(
     mocker: pytest.MockFixture,
-    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     scraper = CatalogScraper()
     client = MagicMock()
     client.get = AsyncMock(side_effect=RuntimeError("boom"))
     mocker.patch("bot.scraper.catalog._httpx_client", return_value=_async_client_cm(client))
 
-    with caplog.at_level("ERROR"):
-        out = await scraper.fetch_course_sections("CSCI 151", respect_rate_limit=False)
+    out = await scraper.fetch_course_sections("CSCI 151", respect_rate_limit=False)
     assert out == []
-    assert "Catalog scrape failed" in caplog.text or "boom" in caplog.text
+    captured = capsys.readouterr().out
+    assert "Catalog scrape failed" in captured or "boom" in captured
 
 
 def test_format_open_seats_message_with_section_lines() -> None:

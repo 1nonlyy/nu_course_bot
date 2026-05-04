@@ -8,6 +8,8 @@ import sys
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import sentry_sdk
+import structlog
 from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -20,6 +22,8 @@ from bot.db.database import get_database
 from bot.handlers import register_handlers
 from bot.scraper.catalog import CatalogScraper
 from bot.scheduler.jobs import poll_catalog_job
+
+logger = structlog.get_logger(__name__)
 
 # Placeholder / obvious non-production token prefixes (real tokens start with digits, then ":").
 _FORBIDDEN_BOT_TOKEN_PREFIXES: tuple[str, ...] = (
@@ -68,12 +72,37 @@ class InjectMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-def _configure_logging(level: str) -> None:
+def _configure_logging(level: str, environment: str) -> None:
+    """
+    structlog: JSON in production, console in ENV=dev; stdlib logging for third-party modules.
+
+    Private to this module — not a stable API for importers.
+    """
+    log_level = getattr(logging, level.upper(), logging.INFO)
     logging.basicConfig(
-        level=level,
+        level=log_level,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
         stream=sys.stdout,
+    )
+    is_dev = environment.strip().lower() == "dev"
+    shared_processors: list[structlog.types.Processor] = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.StackInfoRenderer(),
+        structlog.dev.set_exc_info,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+    ]
+    processors: list[structlog.types.Processor]
+    if is_dev:
+        processors = [*shared_processors, structlog.dev.ConsoleRenderer()]
+    else:
+        processors = [*shared_processors, structlog.processors.JSONRenderer()]
+    structlog.configure(
+        processors=processors,
+        wrapper_class=structlog.make_filtering_bound_logger(log_level),
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
+        cache_logger_on_first_use=True,
     )
 
 
@@ -81,7 +110,9 @@ async def run() -> None:
     """Start polling and scheduler."""
     settings = get_settings()
     _ensure_production_bot_token(settings.bot_token)
-    _configure_logging(settings.log_level)
+    _configure_logging(settings.log_level, settings.environment)
+    if (settings.sentry_dsn or "").strip():
+        sentry_sdk.init(dsn=settings.sentry_dsn, traces_sample_rate=0.1)
 
     db = get_database(settings)
     await db.init_schema()
@@ -108,9 +139,9 @@ async def run() -> None:
         max_instances=1,
     )
     scheduler.start()
-    logging.getLogger(__name__).info(
-        "Scheduler started: interval=%s min",
-        settings.poll_interval_minutes,
+    logger.info(
+        "Scheduler started: interval=%s min" % settings.poll_interval_minutes,
+        poll_interval_minutes=settings.poll_interval_minutes,
     )
 
     try:

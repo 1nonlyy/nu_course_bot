@@ -1,7 +1,10 @@
-.PHONY: install run migrate
+.PHONY: install install-dev run migrate
 
 install:
 	python3 -m pip install -r requirements.txt
+
+install-dev:
+	python3 -m pip install -r requirements-dev.txt
 
 run:
 	python3 -m bot.main

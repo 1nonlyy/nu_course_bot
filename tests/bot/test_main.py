@@ -72,7 +72,10 @@ async def test_run_rejects_bad_token_before_side_effects(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
-async def test_run_happy_path_is_fully_mocked(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_run_happy_path_is_fully_mocked(
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: pytest.MockFixture,
+) -> None:
     """
     Run through `run()` without making any external calls by mocking:
     - DB init
@@ -81,15 +84,19 @@ async def test_run_happy_path_is_fully_mocked(monkeypatch: pytest.MonkeyPatch) -
     """
     import bot.main as main
 
+    sentry_init = mocker.patch("bot.main.sentry_sdk.init")
+
     settings = SimpleNamespace(
         bot_token="123456:ABCDEF_fake",
         log_level="INFO",
         poll_interval_minutes=5,
+        environment="production",
+        sentry_dsn="",
     )
     monkeypatch.setattr(main, "get_settings", lambda: settings)
 
     # Avoid real logging config churn in tests.
-    monkeypatch.setattr(main, "_configure_logging", lambda level: None)
+    monkeypatch.setattr(main, "_configure_logging", lambda *_a, **_k: None)
 
     class FakeDB:
         async def init_schema(self) -> None: ...
@@ -134,4 +141,90 @@ async def test_run_happy_path_is_fully_mocked(monkeypatch: pytest.MonkeyPatch) -
 
     # Should complete without raising.
     await main.run()
+    sentry_init.assert_not_called()
+
+
+def test_configure_logging_production_uses_json_renderer(mocker: pytest.MockFixture) -> None:
+    from structlog.processors import JSONRenderer
+
+    import bot.main as main
+
+    mock_configure = mocker.patch("bot.main.structlog.configure")
+    mocker.patch("bot.main.logging.basicConfig")
+    main._configure_logging("INFO", "production")
+    processors = mock_configure.call_args.kwargs["processors"]
+    assert isinstance(processors[-1], JSONRenderer)
+
+
+def test_configure_logging_dev_uses_console_renderer(mocker: pytest.MockFixture) -> None:
+    from structlog.dev import ConsoleRenderer
+
+    import bot.main as main
+
+    mock_configure = mocker.patch("bot.main.structlog.configure")
+    mocker.patch("bot.main.logging.basicConfig")
+    main._configure_logging("INFO", "  DEV ")
+    processors = mock_configure.call_args.kwargs["processors"]
+    assert isinstance(processors[-1], ConsoleRenderer)
+
+
+@pytest.mark.asyncio
+async def test_run_initializes_sentry_when_dsn_configured(
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: pytest.MockFixture,
+) -> None:
+    import bot.main as main
+
+    sentry_init = mocker.patch("bot.main.sentry_sdk.init")
+    dsn = "https://examplePublicKey@o0.ingest.sentry.io/0"
+    settings = SimpleNamespace(
+        bot_token="123456:ABCDEF_fake",
+        log_level="INFO",
+        poll_interval_minutes=5,
+        environment="production",
+        sentry_dsn=dsn,
+    )
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "_configure_logging", lambda *_a, **_k: None)
+
+    class FakeDB:
+        async def init_schema(self) -> None: ...
+
+    monkeypatch.setattr(main, "get_database", lambda _settings: FakeDB())
+    monkeypatch.setattr(main, "CatalogScraper", lambda _settings: object())
+
+    class FakeSession:
+        async def close(self) -> None: ...
+
+    class FakeBot:
+        def __init__(self, token, default=None) -> None:
+            self.session = FakeSession()
+
+    monkeypatch.setattr(main, "Bot", FakeBot)
+
+    class FakeMiddlewareChain:
+        def middleware(self, _mw) -> None: ...
+
+    class FakeDispatcher:
+        def __init__(self) -> None:
+            self.update = FakeMiddlewareChain()
+
+        async def start_polling(self, _bot) -> None:
+            return None
+
+    monkeypatch.setattr(main, "Dispatcher", FakeDispatcher)
+    monkeypatch.setattr(main, "register_handlers", lambda _dp: None)
+
+    class FakeScheduler:
+        def add_job(self, *args, **kwargs) -> None: ...
+
+        def start(self) -> None: ...
+
+        def shutdown(self, wait: bool = False) -> None: ...
+
+    monkeypatch.setattr(main, "AsyncIOScheduler", FakeScheduler)
+    monkeypatch.setattr(main, "IntervalTrigger", lambda minutes: object())
+
+    await main.run()
+    sentry_init.assert_called_once_with(dsn=dsn, traces_sample_rate=0.1)
 

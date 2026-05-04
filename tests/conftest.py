@@ -178,6 +178,15 @@ def _clean_settings_cache() -> None:
     get_settings.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _reset_structlog_after_test() -> None:
+    """Avoid structlog ``configure()`` from one test affecting the next."""
+    yield
+    import structlog
+
+    structlog.reset_defaults()
+
+
 @pytest.fixture
 def settings_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Provide a complete, valid environment for `bot.config.Settings`."""
@@ -189,6 +198,8 @@ def settings_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CATALOG_TERM_ID", "824")
     monkeypatch.setenv("SCRAPE_MIN_INTERVAL_SECONDS", "180")
     monkeypatch.setenv("CATALOG_IGNORE_TLS_ERRORS", "true")
+    monkeypatch.setenv("ENV", "production")
+    monkeypatch.setenv("SENTRY_DSN", "")
 
     # Ensure `.env` isn't implicitly used in CI/dev machines running tests.
     # Pydantic will prefer explicit env vars, but this avoids surprises.

@@ -44,8 +44,10 @@ class Settings(BaseSettings):
     )
 
     bot_token: str = Field(..., alias="BOT_TOKEN")
+    sentry_dsn: str = Field("", alias="SENTRY_DSN")
     poll_interval_minutes: int = Field(5, ge=1, alias="POLL_INTERVAL_MINUTES")
     database_url: str = Field("sqlite+aiosqlite:///./data/nu_bot.db", alias="DATABASE_URL")
+    environment: str = Field("production", alias="ENV")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     catalog_base_url: str = Field(
         "https://registrar.nu.edu.kz",
