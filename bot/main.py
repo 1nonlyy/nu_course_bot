@@ -6,12 +6,14 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 import sentry_sdk
 import structlog
+from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -59,7 +61,7 @@ def _run_migrations(settings: Settings) -> None:
     """
     os.environ["DATABASE_URL"] = settings.database_url
     try:
-        from alembic import command as alembic_command
+        import alembic.command as alembic_command
         from alembic.config import Config as AlembicConfig
     except Exception:
         # Fallback for environments where the Alembic package isn't installed.
@@ -157,6 +159,61 @@ def _ensure_production_bot_token(token: str) -> None:
         )
 
 
+async def _check_db_health(db: Any) -> str:
+    """
+    Return "ok" if the DB can answer a trivial query; otherwise "error".
+
+    `db` is expected to be `bot.db.database.Database` but is typed as Any here
+    because middleware injects it dynamically and we keep main.py import surface small.
+    """
+    try:
+        async with db.connect() as conn:
+            cur = await conn.execute("SELECT 1")
+            await cur.fetchone()
+        return "ok"
+    except Exception:
+        return "error"
+
+
+def _scheduler_status(scheduler: AsyncIOScheduler) -> str:
+    return "running" if bool(getattr(scheduler, "running", False)) else "stopped"
+
+
+async def _run_health_server(
+    *,
+    db: Any,
+    scheduler: AsyncIOScheduler,
+    started_at_monotonic: float,
+    stop_event: asyncio.Event,
+) -> None:
+    async def healthz(_: web.Request) -> web.Response:
+        db_status = await _check_db_health(db)
+        scheduler_status = _scheduler_status(scheduler)
+        uptime_seconds = int(max(0.0, time.monotonic() - started_at_monotonic))
+        return web.json_response(
+            {
+                "status": "ok",
+                "db": db_status,
+                "scheduler": scheduler_status,
+                "uptime_seconds": uptime_seconds,
+            }
+        )
+
+    app = web.Application()
+    app.router.add_get("/healthz", healthz)
+
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=8080)
+    await site.start()
+    logger.info("Health server started", port=8080, route="/healthz")
+
+    try:
+        await stop_event.wait()
+    finally:
+        await runner.cleanup()
+
+
 class InjectMiddleware(BaseMiddleware):
     """Provide ``db`` and ``scraper`` to handlers."""
 
@@ -212,6 +269,7 @@ def _configure_logging(level: str, environment: str) -> None:
 
 async def run() -> None:
     """Start polling and scheduler."""
+    started_at_monotonic = time.monotonic()
     settings = get_settings()
     _ensure_production_bot_token(settings.bot_token)
     _configure_logging(settings.log_level, settings.environment)
@@ -250,9 +308,25 @@ async def run() -> None:
         poll_interval_minutes=settings.poll_interval_minutes,
     )
 
+    health_stop = asyncio.Event()
+    health_task = asyncio.create_task(
+        _run_health_server(
+            db=db,
+            scheduler=scheduler,
+            started_at_monotonic=started_at_monotonic,
+            stop_event=health_stop,
+        ),
+        name="health-server",
+    )
+
     try:
         await dp.start_polling(bot)
     finally:
+        health_stop.set()
+        try:
+            await health_task
+        except asyncio.CancelledError:
+            pass
         scheduler.shutdown(wait=False)
         await bot.session.close()
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -331,4 +332,260 @@ def test_run_migrations_idempotent_on_existing_legacy_db(
 
     assert count == 1, "Migration must not delete pre-existing rows"
     assert version_rows == [("0001",)], "Alembic must stamp the DB at head"
+
+
+# ---------------------------------------------------------------------------
+# Health endpoint helpers (aiohttp server is mocked)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_check_db_health_happy_path_returns_ok() -> None:
+    import bot.main as main
+
+    class _Cursor:
+        async def fetchone(self):
+            return (1,)
+
+    class _Conn:
+        async def execute(self, _sql: str):
+            return _Cursor()
+
+    class _ConnectCM:
+        async def __aenter__(self):
+            return _Conn()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeDB:
+        def connect(self):
+            return _ConnectCM()
+
+    assert await main._check_db_health(FakeDB()) == "ok"
+
+
+@pytest.mark.asyncio
+async def test_check_db_health_error_returns_error() -> None:
+    import bot.main as main
+
+    class _ConnectCM:
+        async def __aenter__(self):
+            raise RuntimeError("db down")
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeDB:
+        def connect(self):
+            return _ConnectCM()
+
+    assert await main._check_db_health(FakeDB()) == "error"
+
+
+def test_scheduler_status_running_and_stopped() -> None:
+    import bot.main as main
+
+    class Running:
+        running = True
+
+    class Stopped:
+        running = False
+
+    class MissingAttr: ...
+
+    assert main._scheduler_status(Running()) == "running"
+    assert main._scheduler_status(Stopped()) == "stopped"
+    assert main._scheduler_status(MissingAttr()) == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_run_health_server_registers_route_and_serves_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    import bot.main as main
+
+    class _Cursor:
+        async def fetchone(self):
+            return (1,)
+
+    class _Conn:
+        async def execute(self, _sql: str):
+            return _Cursor()
+
+    class _ConnectCM:
+        async def __aenter__(self):
+            return _Conn()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeDB:
+        def connect(self):
+            return _ConnectCM()
+
+    class FakeScheduler:
+        running = True
+
+    captured: dict[str, object] = {}
+
+    class FakeRouter:
+        def add_get(self, path: str, handler):
+            captured["path"] = path
+            captured["handler"] = handler
+
+    class FakeApplication:
+        def __init__(self):
+            self.router = FakeRouter()
+
+    class FakeRunner:
+        def __init__(self, app, access_log=None):
+            self.app = app
+            self.access_log = access_log
+            self.cleaned = False
+
+        async def setup(self) -> None:
+            return None
+
+        async def cleanup(self) -> None:
+            self.cleaned = True
+
+    class FakeSite:
+        def __init__(self, runner, host: str, port: int):
+            self.runner = runner
+            self.host = host
+            self.port = port
+            self.started = False
+
+        async def start(self) -> None:
+            self.started = True
+
+    monkeypatch.setattr(main.web, "Application", FakeApplication)
+
+    runner_box: dict[str, FakeRunner] = {}
+
+    def _runner_factory(app, access_log=None):
+        r = FakeRunner(app, access_log=access_log)
+        runner_box["runner"] = r
+        return r
+
+    monkeypatch.setattr(main.web, "AppRunner", _runner_factory)
+
+    site_box: dict[str, FakeSite] = {}
+
+    def _site_factory(runner, host: str, port: int):
+        s = FakeSite(runner, host=host, port=port)
+        site_box["site"] = s
+        return s
+
+    monkeypatch.setattr(main.web, "TCPSite", _site_factory)
+
+    # Stable uptime: started at 100.0, now at 105.2 → uptime_seconds = 5.
+    monkeypatch.setattr(main.time, "monotonic", lambda: 105.2)
+    stop_event = asyncio.Event()
+
+    task = asyncio.create_task(
+        main._run_health_server(
+            db=FakeDB(),
+            scheduler=FakeScheduler(),
+            started_at_monotonic=100.0,
+            stop_event=stop_event,
+        )
+    )
+
+    # Let the server "start".
+    await asyncio.sleep(0)
+
+    assert captured["path"] == "/healthz"
+    assert site_box["site"].host == "0.0.0.0"
+    assert site_box["site"].port == 8080
+    assert site_box["site"].started is True
+
+    handler = captured["handler"]
+    resp = await handler(object())
+    payload = json.loads(resp.body.decode())
+    assert payload == {
+        "status": "ok",
+        "db": "ok",
+        "scheduler": "running",
+        "uptime_seconds": 5,
+    }
+
+    stop_event.set()
+    await task
+    assert runner_box["runner"].cleaned is True
+
+
+@pytest.mark.asyncio
+async def test_run_health_server_uptime_never_negative_and_db_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import bot.main as main
+
+    class FakeDB:
+        def connect(self):
+            raise RuntimeError("connect should not be called directly")
+
+    class FakeScheduler:
+        running = False
+
+    captured: dict[str, object] = {}
+
+    class FakeRouter:
+        def add_get(self, path: str, handler):
+            captured["handler"] = handler
+
+    class FakeApplication:
+        def __init__(self):
+            self.router = FakeRouter()
+
+    class FakeRunner:
+        def __init__(self, app, access_log=None):
+            self.cleaned = False
+
+        async def setup(self) -> None:
+            return None
+
+        async def cleanup(self) -> None:
+            self.cleaned = True
+
+    class FakeSite:
+        def __init__(self, runner, host: str, port: int):
+            self.started = False
+
+        async def start(self) -> None:
+            self.started = True
+
+    monkeypatch.setattr(main.web, "Application", FakeApplication)
+    monkeypatch.setattr(main.web, "AppRunner", lambda app, access_log=None: FakeRunner(app))
+    monkeypatch.setattr(main.web, "TCPSite", lambda runner, host, port: FakeSite(runner, host, port))
+
+    # started_at_monotonic is in the future → uptime must clamp to 0.
+    monkeypatch.setattr(main.time, "monotonic", lambda: 50.0)
+    monkeypatch.setattr(main, "_check_db_health", AsyncMock(return_value="error"))
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(
+        main._run_health_server(
+            db=FakeDB(),
+            scheduler=FakeScheduler(),
+            started_at_monotonic=100.0,
+            stop_event=stop_event,
+        )
+    )
+    await asyncio.sleep(0)
+
+    resp = await captured["handler"](object())
+    payload = json.loads(resp.body.decode())
+    assert payload["db"] == "error"
+    assert payload["scheduler"] == "stopped"
+    assert payload["uptime_seconds"] == 0
+
+    stop_event.set()
+    await task
 
