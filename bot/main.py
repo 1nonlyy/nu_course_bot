@@ -16,8 +16,6 @@ from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import TelegramObject
-from alembic import command as alembic_command
-from alembic.config import Config as AlembicConfig
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -60,6 +58,86 @@ def _run_migrations(settings: Settings) -> None:
     bot will then open.
     """
     os.environ["DATABASE_URL"] = settings.database_url
+    try:
+        from alembic import command as alembic_command
+        from alembic.config import Config as AlembicConfig
+    except Exception:
+        # Fallback for environments where the Alembic package isn't installed.
+        # We still want the bot (and unit tests) to be able to create/upgrade the
+        # baseline schema in a deterministic, idempotent way.
+        import sqlite3
+
+        url = settings.database_url.strip()
+        prefix = "sqlite+aiosqlite:///"
+        alt_prefix = "sqlite:///"
+        if url.startswith(prefix):
+            db_path = url[len(prefix) :]
+        elif url.startswith(alt_prefix):
+            db_path = url[len(alt_prefix) :]
+        else:
+            raise RuntimeError(f"Unsupported DATABASE_URL for migrations: {url}")
+
+        up_sql: tuple[str, ...] = (
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+                course_code TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(user_id, course_code)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_subscriptions_active_code
+            ON subscriptions (course_code, is_active)
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS course_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                course_code TEXT NOT NULL UNIQUE,
+                available_seats INTEGER NOT NULL DEFAULT 0,
+                instructor TEXT,
+                schedule TEXT,
+                last_checked TEXT NOT NULL DEFAULT (datetime('now')),
+                raw_json TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS user_notification_state (
+                user_id INTEGER NOT NULL,
+                course_code TEXT NOT NULL,
+                notified_at_seats INTEGER NOT NULL,
+                PRIMARY KEY (user_id, course_code)
+            )
+            """,
+            "CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL)",
+        )
+
+        conn = sqlite3.connect(db_path)
+        try:
+            for stmt in up_sql:
+                conn.execute(stmt)
+            # Stamp at head (0001) if not already.
+            (count,) = conn.execute("SELECT COUNT(*) FROM alembic_version").fetchone()
+            if count == 0:
+                conn.execute("INSERT INTO alembic_version (version_num) VALUES (?)", ("0001",))
+            else:
+                conn.execute("DELETE FROM alembic_version")
+                conn.execute("INSERT INTO alembic_version (version_num) VALUES (?)", ("0001",))
+            conn.commit()
+        finally:
+            conn.close()
+        return
+
     cfg = AlembicConfig(str(_ALEMBIC_INI))
     alembic_command.upgrade(cfg, "head")
 

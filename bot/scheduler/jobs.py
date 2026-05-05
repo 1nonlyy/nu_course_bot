@@ -88,15 +88,27 @@ async def check_one_course(
         prev_seats=old_avail,
     )
 
+    prev_seats = old_avail
+    new_seats = new_avail
+    should_n_to_zero = (
+        prev_seats is not None
+        and prev_seats > 0
+        and new_seats == 0
+        and bool(sections)
+    )
+
     title = str(agg.get("course_title") or course_code)
     for uid in user_ids:
         last_notified = await db.get_user_notification_seats(uid, course_code)
         if last_notified is None:
             await db.upsert_user_notification_state(uid, course_code, new_avail)
             continue
-        if new_avail == 0:
+        if new_avail == 0 and not should_n_to_zero:
             await db.upsert_user_notification_state(uid, course_code, 0)
             continue
+        if new_avail == 0 and should_n_to_zero:
+            continue
+        # --- 0→N notification (baseline was zero, seats now available) ---
         if last_notified == 0 and new_avail > 0:
             body = format_open_seats_message(
                 title,
@@ -126,6 +138,32 @@ async def check_one_course(
                 await db.upsert_user_notification_state(uid, course_code, new_avail)
             continue
         await db.upsert_user_notification_state(uid, course_code, new_avail)
+
+    # --- N→0 notification (had open seats, course full again; sections non-empty) ---
+    if should_n_to_zero:
+        prev_seats_int = int(prev_seats) if prev_seats is not None else 0
+        n_to_zero_text = (
+            "⚠️ Места на %s снова закончились (было %s)"
+            % (course_code, prev_seats_int)
+        )
+        for uid in user_ids:
+            try:
+                await _send_with_retry(bot, uid, n_to_zero_text)
+            except TelegramForbiddenError:
+                logger.warning(
+                    "User %s blocked the bot; skip N→0 notify" % uid,
+                    user_id=uid,
+                    course_code=course_code,
+                )
+                await db.upsert_user_notification_state(uid, course_code, 0)
+            except Exception:
+                logger.exception(
+                    "Failed to N→0 notify user %s" % uid,
+                    user_id=uid,
+                    course_code=course_code,
+                )
+            else:
+                await db.upsert_user_notification_state(uid, course_code, 0)
 
 
 async def poll_catalog_job(bot: Bot, db: Database, scraper: CatalogScraper) -> None:

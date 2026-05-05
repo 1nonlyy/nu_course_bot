@@ -339,7 +339,7 @@ async def test_poll_send_failure_does_not_update_notification_state(
 async def test_poll_positive_seats_drop_to_zero_resets_baseline(
     mock_bot: MagicMock,
 ) -> None:
-    """Edge: was open seats, course fills again — store 0 so a later opening can notify."""
+    """Edge: was open seats, course fills again — N→0 notify and store 0 for next 0→N."""
     prev = CourseSnapshot(
         id=1,
         course_code="CSCI 151",
@@ -360,7 +360,10 @@ async def test_poll_positive_seats_drop_to_zero_resets_baseline(
 
     await poll_catalog_job(mock_bot, db, scraper)
 
-    mock_bot.send_message.assert_not_awaited()
+    mock_bot.send_message.assert_awaited_once_with(
+        6001,
+        "⚠️ Места на CSCI 151 снова закончились (было 4)",
+    )
     db.upsert_user_notification_state.assert_awaited_once_with(6001, "CSCI 151", 0)
 
 
@@ -602,10 +605,19 @@ async def test_check_one_course_nonzero_baseline_no_push(
 async def test_check_one_course_positive_to_zero_resets_state(
     mock_bot: MagicMock,
 ) -> None:
-    """Course fills up again (seats → 0): reset user state to 0 so next opening notifies."""
+    """Course fills up again (seats → 0): N→0 push and reset user state to 0."""
+    prev = CourseSnapshot(
+        id=1,
+        course_code="CSCI 151",
+        available_seats=5,
+        instructor=None,
+        schedule=None,
+        last_checked=datetime.now(timezone.utc),
+        raw_json=None,
+    )
     sec = _sample_section(available_seats=0)
     db = MagicMock()
-    db.get_snapshot = AsyncMock(return_value=None)
+    db.get_snapshot = AsyncMock(return_value=prev)
     db.upsert_snapshot = AsyncMock()
     db.get_user_notification_seats = AsyncMock(return_value=5)
     db.upsert_user_notification_state = AsyncMock()
@@ -615,8 +627,49 @@ async def test_check_one_course_positive_to_zero_resets_state(
         "CSCI 151", [55], mock_bot, db, scraper, sem=_make_sem(), checked_at=_now()
     )
 
-    mock_bot.send_message.assert_not_awaited()
+    mock_bot.send_message.assert_awaited_once_with(
+        55,
+        "⚠️ Места на CSCI 151 снова закончились (было 5)",
+    )
     db.upsert_user_notification_state.assert_awaited_once_with(55, "CSCI 151", 0)
+
+
+@pytest.mark.asyncio
+async def test_check_one_course_n_to_zero_notifies_all_subscribers(
+    mock_bot: MagicMock,
+) -> None:
+    """N→0: every subscriber gets the closed-again message."""
+    prev = CourseSnapshot(
+        id=1,
+        course_code="CSCI 151",
+        available_seats=3,
+        instructor=None,
+        schedule=None,
+        last_checked=datetime.now(timezone.utc),
+        raw_json=None,
+    )
+    sec = _sample_section(available_seats=0)
+    db = MagicMock()
+    db.get_snapshot = AsyncMock(return_value=prev)
+    db.upsert_snapshot = AsyncMock()
+    db.get_user_notification_seats = AsyncMock(side_effect=[3, 1])
+    db.upsert_user_notification_state = AsyncMock()
+    scraper = _scraper_with_sections({"CSCI 151": [sec]})
+
+    await check_one_course(
+        "CSCI 151",
+        [10, 20],
+        mock_bot,
+        db,
+        scraper,
+        sem=_make_sem(),
+        checked_at=_now(),
+    )
+
+    assert mock_bot.send_message.await_count == 2
+    msg = "⚠️ Места на CSCI 151 снова закончились (было 3)"
+    mock_bot.send_message.assert_any_await(10, msg)
+    mock_bot.send_message.assert_any_await(20, msg)
 
 
 @pytest.mark.asyncio
